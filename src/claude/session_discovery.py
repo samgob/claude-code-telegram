@@ -30,8 +30,8 @@ _DEEP_SEARCH_BYTES = 64 * 1024  # cap per-file content scanned for keyword searc
 _DEEP_SEARCH_CANDIDATES = 200  # cap sessions inspected during a search
 
 # Words that carry no signal for picking a session, so we drop them from the
-# query before matching. Keep this list small — anything we drop becomes
-# unsearchable.
+# query before matching. Recency hints (latest/recent/etc.) are also dropped
+# because recency is the default sort and asking for "latest" is redundant.
 _STOPWORDS = frozenset(
     {
         "a",
@@ -51,11 +51,19 @@ _STOPWORDS = frozenset(
         "to",
         "and",
         "or",
+        # recency hints — implied by default behavior
+        "latest",
+        "recent",
+        "newest",
+        "last",
+        "yesterday",
+        "today",
     }
 )
 
-# Words that signal "prefer the most recent match" rather than ranking by hits.
-_RECENCY_HINTS = frozenset({"latest", "recent", "newest", "last", "yesterday", "today"})
+# Routine transcripts always start with this envelope in the first user
+# message. Detected to let callers exclude scheduled-task runs by default.
+_ROUTINE_PREFIX = "<scheduled-task"
 
 
 @dataclass
@@ -68,6 +76,7 @@ class SessionInfo:
     snippet: str
     file_path: Path
     size_bytes: int
+    is_routine: bool = False
 
     @property
     def short_id(self) -> str:
@@ -145,6 +154,7 @@ def discover_sessions(
     limit: int = 20,
     projects_root: Path = DEFAULT_PROJECTS_ROOT,
     within_cwd: Optional[Path] = None,
+    include_routines: bool = False,
 ) -> List[SessionInfo]:
     """List recent Claude Code sessions, newest first.
 
@@ -157,6 +167,11 @@ def discover_sessions(
     within_cwd:
         If provided, only return sessions whose recorded ``cwd`` equals (or is a
         child of) this path. Used by `/use` to filter to a sandboxed workspace.
+    include_routines:
+        If False (default), scheduled-task transcripts are filtered out. These
+        are rarely useful as resume targets — they're snapshots of completed
+        automation runs, and their outputs live in canonical files. Pass True
+        to include them (e.g., for the ``/sessions --all`` UI affordance).
     """
     if not projects_root.exists():
         return []
@@ -170,14 +185,18 @@ def discover_sessions(
     all_files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
 
     results: List[SessionInfo] = []
-    # Scan more than `limit` because some sessions may be filtered out by within_cwd.
-    scan_budget = max(limit * 4, 40) if within_cwd else limit
+    # Scan more than `limit` since some sessions may be filtered out below.
+    expand = (4 if within_cwd else 1) * (3 if not include_routines else 1)
+    scan_budget = max(limit * expand, 40)
     for path in all_files[:scan_budget]:
         try:
             stat = path.stat()
         except OSError:
             continue
         cwd, snippet = _extract_session_metadata(path)
+        is_routine = snippet.startswith(_ROUTINE_PREFIX)
+        if not include_routines and is_routine:
+            continue
         if within_cwd is not None:
             if cwd is None:
                 continue
@@ -193,6 +212,7 @@ def discover_sessions(
                 snippet=snippet,
                 file_path=path,
                 size_bytes=stat.st_size,
+                is_routine=is_routine,
             )
         )
         if len(results) >= limit:
@@ -204,8 +224,13 @@ def find_by_prefix(
     prefix: str,
     projects_root: Path = DEFAULT_PROJECTS_ROOT,
     within_cwd: Optional[Path] = None,
+    include_routines: bool = True,
 ) -> List[SessionInfo]:
     """Return sessions whose id starts with ``prefix``.
+
+    Routines are INCLUDED here by default because looking up by exact id
+    prefix is an unambiguous user intent — if they typed the id, they meant
+    that session whether or not it was a routine.
 
     Empty prefix returns ``[]`` rather than every session (defensive — callers
     should never request "all sessions" via this function).
@@ -214,27 +239,27 @@ def find_by_prefix(
         return []
     # Pull a generous set; prefix match is cheap.
     candidates = discover_sessions(
-        limit=500, projects_root=projects_root, within_cwd=within_cwd
+        limit=500,
+        projects_root=projects_root,
+        within_cwd=within_cwd,
+        include_routines=include_routines,
     )
     return [s for s in candidates if s.session_id.startswith(prefix)]
 
 
-def _tokenize_query(query: str) -> tuple[list[str], bool]:
-    """Split ``query`` into searchable tokens and detect a recency hint.
+def _tokenize_query(query: str) -> list[str]:
+    """Split ``query`` into searchable tokens.
 
-    Returns ``(tokens, prefer_latest)``. Tokens are lowercased, deduplicated,
-    stripped of stopwords, and limited to those with at least 2 characters so
-    a query like ``"a 1"`` doesn't trigger a near-empty match.
+    Tokens are lowercased, deduplicated, stripped of stopwords (including
+    recency hints — recency is the default sort), and limited to those with
+    at least 2 characters so a query like ``"a 1"`` doesn't trigger a
+    near-empty match.
     """
     seen: set[str] = set()
     tokens: list[str] = []
-    prefer_latest = False
     for raw in query.lower().split():
         t = raw.strip(".,!?:;\"'()[]")
         if not t:
-            continue
-        if t in _RECENCY_HINTS:
-            prefer_latest = True
             continue
         if t in _STOPWORDS:
             continue
@@ -244,7 +269,7 @@ def _tokenize_query(query: str) -> tuple[list[str], bool]:
             continue
         seen.add(t)
         tokens.append(t)
-    return tokens, prefer_latest
+    return tokens
 
 
 def _content_contains_all(file_path: Path, tokens: list[str]) -> int:
@@ -275,22 +300,31 @@ def search_sessions(
     limit: int = 5,
     projects_root: Path = DEFAULT_PROJECTS_ROOT,
     within_cwd: Optional[Path] = None,
+    include_routines: bool = False,
 ) -> List[SessionInfo]:
-    """Find sessions matching a natural-language ``query``.
+    """Find sessions matching a natural-language ``query``, newest first.
 
     The query is tokenized (stopwords + recency hints stripped) and each
-    candidate transcript is scanned for ALL remaining tokens. Results are
-    ranked by ``(prefer_latest, hit_count_desc, mtime_desc)``:
+    candidate transcript's first ``_DEEP_SEARCH_BYTES`` bytes are scanned
+    for ALL remaining tokens (AND semantics, not OR). The raw scan includes
+    everything the transcript records — message content, tool inputs/outputs,
+    file paths read or written — so a session that never literally mentions
+    "wesco" but edits ``Projects/Wesco POC/schema.json`` still matches.
 
-    - if the query carried a recency hint (``latest``, ``most recent``, etc.),
-      results are sorted purely by mtime among token-matching transcripts
-    - otherwise, transcripts with more keyword hits rank higher; ties break
-      newest-first
+    Results are sorted by mtime descending (recency-first) because the
+    common workflow is to start fresh after reaching a stopping point;
+    resumes target recent work, not archival sessions. A relevance floor
+    applies: if any match has 2+ token hits, 1-hit incidental mentions are
+    dropped (prevents the most recent transcript that name-dropped the
+    keyword from outranking a session focused on it).
+
+    Routines (scheduled-task transcripts) are excluded by default. Pass
+    ``include_routines=True`` to include them.
 
     Returns at most ``limit`` results. An empty token set returns ``[]`` —
     callers must validate before showing "all sessions" via this function.
     """
-    tokens, prefer_latest = _tokenize_query(query)
+    tokens = _tokenize_query(query)
     if not tokens:
         return []
 
@@ -298,6 +332,7 @@ def search_sessions(
         limit=_DEEP_SEARCH_CANDIDATES,
         projects_root=projects_root,
         within_cwd=within_cwd,
+        include_routines=include_routines,
     )
 
     scored: list[tuple[int, float, SessionInfo]] = []
@@ -307,14 +342,11 @@ def search_sessions(
             continue
         scored.append((hits, s.last_modified.timestamp(), s))
 
-    if prefer_latest:
-        # Relevance floor: if any match has multiple hits, drop incidental
-        # 1-hit matches (avoids "the routine session newest in time that
-        # happened to mention the keyword once" beating a focused session).
-        max_hits = max((h for h, _, _ in scored), default=0)
-        if max_hits >= 2:
-            scored = [t for t in scored if t[0] >= 2]
-        scored.sort(key=lambda x: x[1], reverse=True)
-    else:
-        scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    # Relevance floor: if any match has 2+ hits, drop 1-hit incidentals.
+    max_hits = max((h for h, _, _ in scored), default=0)
+    if max_hits >= 2:
+        scored = [t for t in scored if t[0] >= 2]
+
+    # Recency-first.
+    scored.sort(key=lambda x: x[1], reverse=True)
     return [s for _, _, s in scored[:limit]]

@@ -262,26 +262,20 @@ def test_session_info_relative_age_buckets():
 # --- search_sessions / tokenizer -------------------------------------------
 
 
-def test_tokenize_drops_stopwords_and_short_tokens():
-    tokens, latest = _tokenize_query("the latest wesco session about a poc")
-    # Drops: the, latest (recency), session, about, a — keeps content words
-    assert "wesco" in tokens
-    assert "poc" in tokens
-    assert "the" not in tokens
-    assert "session" not in tokens
-    assert "latest" not in tokens  # consumed as recency hint
-    assert latest is True
+def test_tokenize_drops_stopwords_and_recency_hints():
+    tokens = _tokenize_query("the latest wesco session about a poc")
+    # Drops: the, latest (recency hint, now a stopword), session, about, a
+    assert tokens == ["wesco", "poc"]
 
 
 def test_tokenize_dedups_and_lowercases():
-    tokens, _ = _tokenize_query("Wesco WESCO wesco POC poc")
+    tokens = _tokenize_query("Wesco WESCO wesco POC poc")
     assert tokens == ["wesco", "poc"]
 
 
 def test_tokenize_empty_returns_no_tokens():
-    tokens, latest = _tokenize_query("the a session")
+    tokens = _tokenize_query("the a session")
     assert tokens == []
-    assert latest is False
 
 
 def test_search_finds_keyword_in_first_message(tmp_path):
@@ -327,34 +321,32 @@ def test_search_requires_all_tokens(tmp_path):
     assert out[0].session_id.startswith("bbbb")
 
 
-def test_search_ranks_by_hit_count_when_no_recency_hint(tmp_path):
+def test_search_sorts_by_recency_when_hits_comparable(tmp_path):
+    """Default: recency-first when no hit-count winner."""
     root = tmp_path / "projects"
     _write_session(
         root,
         "-a",
         "aaaaaaaa-aaaa-1111-1111-111111111111",
         cwd="/x",
-        first_user_msg="wesco mentioned just once",
-        mtime_offset=-1000,  # older
+        first_user_msg="wesco mentioned once here",  # older
+        mtime_offset=-1000,
     )
     _write_session(
         root,
         "-a",
         "bbbbbbbb-bbbb-2222-2222-222222222222",
         cwd="/x",
-        first_user_msg="wesco wesco wesco wesco — heavy mention",
-        mtime_offset=-2000,  # older still
+        first_user_msg="wesco mentioned once here too",  # newer
     )
     out = search_sessions("wesco", projects_root=root)
-    # Higher hit count wins despite older mtime
     assert out[0].session_id.startswith("bbbb")
     assert out[1].session_id.startswith("aaaa")
 
 
-def test_search_recency_hint_filters_incidental_mentions(tmp_path):
-    """With 'latest', a multi-hit older session beats a 1-hit newer one
-    (relevance floor protects against routine sessions that mention the
-    keyword in passing being top-ranked just for being newest)."""
+def test_search_relevance_floor_drops_incidental_mentions(tmp_path):
+    """A multi-hit older session beats a 1-hit newer one because the
+    relevance floor drops 1-hit incidentals when stronger matches exist."""
     root = tmp_path / "projects"
     _write_session(
         root,
@@ -362,7 +354,7 @@ def test_search_recency_hint_filters_incidental_mentions(tmp_path):
         "aaaaaaaa-aaaa-1111-1111-111111111111",
         cwd="/x",
         first_user_msg="wesco wesco wesco mentioned many times",
-        mtime_offset=-1000,  # older but many hits
+        mtime_offset=-1000,
     )
     _write_session(
         root,
@@ -371,14 +363,13 @@ def test_search_recency_hint_filters_incidental_mentions(tmp_path):
         cwd="/x",
         first_user_msg="wesco mentioned once",  # newer but 1 hit
     )
-    out = search_sessions("latest wesco", projects_root=root)
-    # Newer-1-hit dropped by relevance floor; multi-hit older session wins
+    out = search_sessions("wesco", projects_root=root)
     assert len(out) == 1
     assert out[0].session_id.startswith("aaaa")
 
 
-def test_search_recency_hint_keeps_singletons_when_no_multi_hits(tmp_path):
-    """If every match is a 1-hit incidental mention, recency still works."""
+def test_search_keeps_all_when_all_singleton_hits(tmp_path):
+    """If every match is a 1-hit, none get filtered — recency wins."""
     root = tmp_path / "projects"
     _write_session(
         root,
@@ -395,8 +386,7 @@ def test_search_recency_hint_keeps_singletons_when_no_multi_hits(tmp_path):
         cwd="/x",
         first_user_msg="wesco only once here too",
     )
-    out = search_sessions("latest wesco", projects_root=root)
-    # Both kept; newer first
+    out = search_sessions("wesco", projects_root=root)
     assert len(out) == 2
     assert out[0].session_id.startswith("bbbb")
 
@@ -464,3 +454,108 @@ def test_search_limit_caps_results(tmp_path):
         _write_session(root, "-a", sid, cwd="/x", first_user_msg=f"wesco run {i}")
     out = search_sessions("wesco", projects_root=root, limit=3)
     assert len(out) == 3
+
+
+# --- routine detection + filtering -----------------------------------------
+
+
+def _write_routine_session(
+    root: Path,
+    session_id: str,
+    cwd: str,
+    routine_name: str,
+    mtime_offset: int = 0,
+) -> Path:
+    """A scheduled-task transcript: first user message is the <scheduled-task> envelope."""
+    return _write_session(
+        root,
+        "-x",
+        session_id,
+        cwd=cwd,
+        first_user_msg=f'<scheduled-task name="{routine_name}" file="/skill.md">\nrun the thing\n</scheduled-task>',
+        mtime_offset=mtime_offset,
+    )
+
+
+def test_discover_excludes_routines_by_default(tmp_path):
+    root = tmp_path / "projects"
+    _write_routine_session(
+        root, "11111111-1111-1111-1111-111111111111", "/x", "email-slack-triage-morning"
+    )
+    _write_session(
+        root,
+        "-x",
+        "22222222-2222-2222-2222-222222222222",
+        cwd="/x",
+        first_user_msg="my own work",
+    )
+    out = discover_sessions(limit=10, projects_root=root)
+    ids = [s.session_id for s in out]
+    assert any(i.startswith("2222") for i in ids)
+    assert not any(i.startswith("1111") for i in ids)
+
+
+def test_discover_includes_routines_when_asked(tmp_path):
+    root = tmp_path / "projects"
+    _write_routine_session(
+        root, "11111111-1111-1111-1111-111111111111", "/x", "personal-email-triage"
+    )
+    _write_session(
+        root,
+        "-x",
+        "22222222-2222-2222-2222-222222222222",
+        cwd="/x",
+        first_user_msg="my own work",
+    )
+    out = discover_sessions(limit=10, projects_root=root, include_routines=True)
+    assert len(out) == 2
+    routines = [s for s in out if s.is_routine]
+    assert len(routines) == 1
+    assert routines[0].session_id.startswith("1111")
+
+
+def test_search_excludes_routines_by_default(tmp_path):
+    """`/use personal email` should not return personal-email-triage routine runs."""
+    root = tmp_path / "projects"
+    _write_routine_session(
+        root,
+        "11111111-1111-1111-1111-111111111111",
+        "/x",
+        "personal-email-triage",
+    )
+    _write_session(
+        root,
+        "-x",
+        "22222222-2222-2222-2222-222222222222",
+        cwd="/x",
+        first_user_msg="Help me draft a personal email to my brother",
+    )
+    out = search_sessions("personal email", projects_root=root)
+    ids = [s.session_id for s in out]
+    assert any(i.startswith("2222") for i in ids)
+    assert not any(i.startswith("1111") for i in ids)
+
+
+def test_search_includes_routines_when_asked(tmp_path):
+    root = tmp_path / "projects"
+    _write_routine_session(
+        root,
+        "11111111-1111-1111-1111-111111111111",
+        "/x",
+        "personal-email-triage",
+    )
+    out = search_sessions("personal email", projects_root=root, include_routines=True)
+    assert len(out) == 1
+    assert out[0].is_routine is True
+
+
+def test_find_by_prefix_includes_routines_by_default(tmp_path):
+    """Prefix lookup is exact-intent: include routines so the typed id resolves
+    even when it points at a scheduled-task transcript."""
+    root = tmp_path / "projects"
+    _write_routine_session(
+        root, "11111111-1111-1111-1111-111111111111", "/x", "system-architect"
+    )
+    out = find_by_prefix("11111111", projects_root=root)
+    assert len(out) == 1
+    assert out[0].is_routine is True

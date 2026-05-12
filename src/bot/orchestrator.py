@@ -1687,16 +1687,24 @@ class MessageOrchestrator:
     ) -> None:
         """List recent Claude sessions on disk.
 
-        /sessions          — 10 most recent within the approved directory
-        /sessions <N>      — N most recent (max 25)
+        /sessions             — 10 most recent interactive sessions
+        /sessions <N>         — N most recent (max 25)
+        /sessions --all       — include scheduled-task (routine) sessions
+        /sessions --all <N>   — both, with explicit limit
         """
         args = update.message.text.split()[1:] if update.message.text else []
+        include_routines = False
+        if args and args[0] in ("--all", "--routines", "-a"):
+            include_routines = True
+            args = args[1:]
         limit = 10
         if args and args[0].isdigit():
             limit = max(1, min(int(args[0]), 25))
 
         sessions = discover_sessions(
-            limit=limit, within_cwd=self.settings.approved_directory
+            limit=limit,
+            within_cwd=self.settings.approved_directory,
+            include_routines=include_routines,
         )
         if not sessions:
             await update.message.reply_text(
@@ -1711,6 +1719,7 @@ class MessageOrchestrator:
         lines: List[str] = []
         for s in sessions:
             marker = "● " if s.session_id == current_id else "○ "
+            tag = " ⚙ " if s.is_routine else " "
             snippet = s.snippet or "(no user message yet)"
             try:
                 rel_cwd = (
@@ -1722,13 +1731,18 @@ class MessageOrchestrator:
             except (ValueError, OSError):
                 cwd_hint = ""
             lines.append(
-                f"{marker}<code>{s.short_id}</code> "
+                f"{marker}<code>{s.short_id}</code>{tag}"
                 f"<i>({s.relative_age()}{cwd_hint})</i>\n"
                 f"   {escape_html(snippet)}"
             )
 
         body = "\n".join(lines)
-        footer = "\n\nUse <code>/use &lt;prefix&gt;</code> to switch."
+        footer_lines = ["Use <code>/use &lt;prefix-or-query&gt;</code> to switch."]
+        if not include_routines:
+            footer_lines.append(
+                "Routine runs hidden — add <code>--all</code> to include them."
+            )
+        footer = "\n\n" + "\n".join(footer_lines)
         await update.message.reply_text(
             f"<b>Recent sessions</b>\n\n{body}{footer}", parse_mode="HTML"
         )
@@ -1738,16 +1752,21 @@ class MessageOrchestrator:
     ) -> None:
         """Resume a specific Claude session by id prefix OR natural query.
 
-        /use <id-prefix>       — exact prefix routing (8-char hex prefix typical)
-        /use latest wesco      — keyword search across recent transcripts
-        /use the lexisnexis    — natural language; stopwords + recency hints
-                                 are stripped automatically
+        /use <id-prefix>        — exact prefix (4+ hex chars; routines included)
+        /use wesco              — keyword search across interactive transcripts
+        /use the wesco poc      — natural language; stopwords stripped
+        /use --all wesco        — include routine (scheduled-task) sessions
+        /use --all <id-prefix>  — same flag works for prefix mode too
+
+        Routines are excluded by default — they're rarely useful resume
+        targets, and their outputs live in canonical files. Pass --all (or
+        --routines / -a) to include them. Search results are sorted by
+        recency, with a relevance floor that drops 1-hit incidentals when
+        better matches exist.
 
         The router picks prefix-mode when the argument looks like a hex id
-        fragment (4+ chars, hex only). Anything else goes through keyword
-        search. When the search resolves to a single candidate, the session
-        is resumed immediately; otherwise a short disambiguation list is
-        returned.
+        fragment (4+ chars, hex only). Anything else goes through search.
+        Single match → resume immediately. Multiple → disambiguation list.
         """
         if not update.message.text:
             return
@@ -1757,12 +1776,27 @@ class MessageOrchestrator:
             await update.message.reply_text(
                 "Usage:\n"
                 "  <code>/use &lt;id-prefix&gt;</code> — exact id (4+ hex chars)\n"
-                "  <code>/use latest wesco</code> — keyword search\n\n"
+                "  <code>/use wesco</code> — keyword search (newest first)\n"
+                "  <code>/use --all &lt;query&gt;</code> — include routine runs\n\n"
                 "See <code>/sessions</code> to browse.",
                 parse_mode="HTML",
             )
             return
         query = raw_after[1].strip()
+
+        # Strip a leading --all / --routines / -a flag.
+        include_routines = False
+        first_tok = query.split(maxsplit=1)[0] if query else ""
+        if first_tok in ("--all", "--routines", "-a"):
+            include_routines = True
+            remainder = query.split(maxsplit=1)
+            query = remainder[1].strip() if len(remainder) > 1 else ""
+            if not query:
+                await update.message.reply_text(
+                    "Flag <code>--all</code> needs a query or id prefix.",
+                    parse_mode="HTML",
+                )
+                return
 
         # Route: hex prefix vs natural-language query.
         is_prefix = (
@@ -1773,12 +1807,17 @@ class MessageOrchestrator:
 
         if is_prefix:
             matches = find_by_prefix(
-                query.lower(), within_cwd=self.settings.approved_directory
+                query.lower(),
+                within_cwd=self.settings.approved_directory,
+                include_routines=True,
             )
             mode_hint = "prefix"
         else:
             matches = search_sessions(
-                query, limit=10, within_cwd=self.settings.approved_directory
+                query,
+                limit=10,
+                within_cwd=self.settings.approved_directory,
+                include_routines=include_routines,
             )
             mode_hint = "search"
 
@@ -1792,7 +1831,7 @@ class MessageOrchestrator:
 
         if len(matches) > 1:
             preview = "\n".join(
-                f"  <code>{m.short_id}</code> "
+                f"  <code>{m.short_id}</code>{' ⚙' if m.is_routine else ''} "
                 f"<i>({m.relative_age()})</i> — "
                 f"{escape_html(m.snippet[:70])}"
                 for m in matches[:5]
