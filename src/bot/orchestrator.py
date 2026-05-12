@@ -30,6 +30,11 @@ from telegram.ext import (
 )
 
 from ..claude.sdk_integration import StreamUpdate
+from ..claude.session_discovery import (
+    SessionInfo,
+    discover_sessions,
+    find_by_prefix,
+)
 from ..config.settings import Settings
 from ..projects import PrivateTopicsUnavailableError
 from .utils.draft_streamer import DraftStreamer, generate_draft_id
@@ -327,6 +332,8 @@ class MessageOrchestrator:
             ("status", self.agentic_status),
             ("verbose", self.agentic_verbose),
             ("repo", self.agentic_repo),
+            ("sessions", self.agentic_sessions),
+            ("use", self.agentic_use),
             ("restart", command.restart_command),
         ]
         if self.settings.enable_project_threads:
@@ -460,6 +467,8 @@ class MessageOrchestrator:
                 BotCommand("status", "Show session status"),
                 BotCommand("verbose", "Set output verbosity (0/1/2)"),
                 BotCommand("repo", "List repos / switch workspace"),
+                BotCommand("sessions", "List recent Claude sessions"),
+                BotCommand("use", "Resume a session by id prefix"),
                 BotCommand("restart", "Restart the bot"),
             ]
             if self.settings.enable_project_threads:
@@ -1668,6 +1677,136 @@ class MessageOrchestrator:
             "<b>Repos</b>\n\n" + "\n".join(lines),
             parse_mode="HTML",
             reply_markup=reply_markup,
+        )
+
+    # --- Session listing / arbitrary resume ---------------------------------
+
+    async def agentic_sessions(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """List recent Claude sessions on disk.
+
+        /sessions          — 10 most recent within the approved directory
+        /sessions <N>      — N most recent (max 25)
+        """
+        args = update.message.text.split()[1:] if update.message.text else []
+        limit = 10
+        if args and args[0].isdigit():
+            limit = max(1, min(int(args[0]), 25))
+
+        sessions = discover_sessions(
+            limit=limit, within_cwd=self.settings.approved_directory
+        )
+        if not sessions:
+            await update.message.reply_text(
+                "No sessions found under <code>"
+                f"{escape_html(str(self.settings.approved_directory))}"
+                "</code>.",
+                parse_mode="HTML",
+            )
+            return
+
+        current_id = context.user_data.get("claude_session_id")
+        lines: List[str] = []
+        for s in sessions:
+            marker = "● " if s.session_id == current_id else "○ "
+            snippet = s.snippet or "(no user message yet)"
+            try:
+                rel_cwd = (
+                    s.cwd.relative_to(self.settings.approved_directory)
+                    if s.cwd
+                    else None
+                )
+                cwd_hint = f" · {rel_cwd}/" if rel_cwd and str(rel_cwd) != "." else ""
+            except (ValueError, OSError):
+                cwd_hint = ""
+            lines.append(
+                f"{marker}<code>{s.short_id}</code> "
+                f"<i>({s.relative_age()}{cwd_hint})</i>\n"
+                f"   {escape_html(snippet)}"
+            )
+
+        body = "\n".join(lines)
+        footer = "\n\nUse <code>/use &lt;prefix&gt;</code> to switch."
+        await update.message.reply_text(
+            f"<b>Recent sessions</b>\n\n{body}{footer}", parse_mode="HTML"
+        )
+
+    async def agentic_use(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Resume a specific Claude session by id prefix.
+
+        /use <8-char-prefix>  — switch the current session pointer to that id.
+                                If the session's cwd differs, also switches
+                                the current_directory so the next message
+                                resumes correctly.
+        """
+        args = update.message.text.split()[1:] if update.message.text else []
+        if not args:
+            await update.message.reply_text(
+                "Usage: <code>/use &lt;id-prefix&gt;</code> "
+                "(see <code>/sessions</code>)",
+                parse_mode="HTML",
+            )
+            return
+
+        prefix = args[0].strip().lower()
+        if len(prefix) < 4:
+            await update.message.reply_text(
+                "Prefix too short — use at least 4 characters."
+            )
+            return
+
+        matches = find_by_prefix(prefix, within_cwd=self.settings.approved_directory)
+        if not matches:
+            await update.message.reply_text(
+                f"No session matches <code>{escape_html(prefix)}</code> "
+                "under the approved directory.",
+                parse_mode="HTML",
+            )
+            return
+        if len(matches) > 1:
+            preview = "\n".join(
+                f"  <code>{m.short_id}</code> — {escape_html(m.snippet[:60])}"
+                for m in matches[:5]
+            )
+            more = f"\n  …+{len(matches) - 5} more" if len(matches) > 5 else ""
+            await update.message.reply_text(
+                f"Ambiguous prefix — {len(matches)} matches:\n{preview}{more}\n"
+                "Use a longer prefix.",
+                parse_mode="HTML",
+            )
+            return
+
+        target = matches[0]
+        if target.cwd is None:
+            await update.message.reply_text(
+                f"Session <code>{target.short_id}</code> has no recorded "
+                "working directory — cannot safely resume.",
+                parse_mode="HTML",
+            )
+            return
+
+        context.user_data["claude_session_id"] = target.session_id
+        context.user_data["current_directory"] = target.cwd
+        context.user_data["force_new_session"] = False
+
+        try:
+            rel = target.cwd.relative_to(self.settings.approved_directory)
+            cwd_display = (
+                f"<code>{escape_html(str(rel))}/</code>"
+                if str(rel) != "."
+                else "<i>workspace root</i>"
+            )
+        except (ValueError, OSError):
+            cwd_display = f"<code>{escape_html(str(target.cwd))}</code>"
+
+        snippet = escape_html(target.snippet[:120]) if target.snippet else "(empty)"
+        await update.message.reply_text(
+            f"Resumed <code>{target.short_id}</code> · {cwd_display} · "
+            f"{target.relative_age()}\nLast user msg: <i>{snippet}</i>",
+            parse_mode="HTML",
         )
 
     async def _handle_stop_callback(

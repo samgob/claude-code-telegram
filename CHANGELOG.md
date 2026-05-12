@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`/sessions` and `/use` commands**: List recent Claude sessions across all sources (bot, CLI, IDE, scheduled tasks) and resume any of them by 4+ character id prefix. Sessions are discovered by scanning `~/.claude/projects/` JSONL transcripts and filtered to `APPROVED_DIRECTORY` for safety. `/use` switches both the active session id and the working directory atomically, so the next message resumes via Claude SDK `--resume`. Closes the gap where the bot's auto-resume was scoped to one session per project directory; you can now jump into any past session, including those started by scheduled tasks or external `claude` invocations.
+
 ## [1.6.0] - 2026-03-30
 
 ### Added
