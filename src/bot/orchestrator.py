@@ -1855,11 +1855,29 @@ class MessageOrchestrator:
             )
             mode_hint = "prefix"
         else:
-            # Exclude the bot's own currently-active session — it accumulates
-            # everything the user types and would otherwise dominate keyword
-            # search for any topic the user has mentioned in this chat.
+            # Exclude ALL bot-managed sessions, not just the currently-active
+            # one. Bot sessions accumulate every message the user types
+            # (including topic mentions like "wesco" via /use commands and
+            # follow-up questions), so any prior bot conversation would
+            # otherwise dominate keyword search for topics the user discusses
+            # via the bot. Query the SDK session manager for the list.
+            excluded: set[str] = set()
             current_id = context.user_data.get("claude_session_id")
-            excluded = {current_id} if current_id else set()
+            if current_id:
+                excluded.add(current_id)
+            claude_integration = context.bot_data.get("claude_integration")
+            if claude_integration is not None:
+                try:
+                    bot_sessions = await claude_integration.get_user_sessions(
+                        update.effective_user.id
+                    )
+                    excluded.update(s["session_id"] for s in bot_sessions)
+                except Exception as e:
+                    logger.warning(
+                        "Could not enumerate bot sessions for exclusion",
+                        error=str(e),
+                    )
+
             matches = search_sessions(
                 query,
                 limit=10,
@@ -1929,8 +1947,14 @@ class MessageOrchestrator:
         for m in alternates:
             tag = "⚙ " if m.is_routine else ""
             # Telegram button text limit is ~64 chars; trim the snippet.
-            snippet_short = m.snippet[:40].rstrip()
-            label = f"{tag}{m.short_id} · {snippet_short}"[:60]
+            # Telegram inline-button text limit is ~64 bytes; emojis are
+            # multi-byte. Cap at 60 chars to stay safe with utf-8 overhead.
+            # Reserve ~12 chars for the id + separator (+ optional ⚙ tag);
+            # the rest is snippet.
+            reserve = 12 + (2 if m.is_routine else 0)
+            snippet_room = 60 - reserve
+            snippet_short = m.snippet[:snippet_room].rstrip()
+            label = f"{tag}{m.short_id} · {snippet_short}"[:64]
             rows.append(
                 [InlineKeyboardButton(label, callback_data=f"use:{m.session_id}")]
             )
