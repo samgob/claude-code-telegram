@@ -301,6 +301,7 @@ def search_sessions(
     projects_root: Path = DEFAULT_PROJECTS_ROOT,
     within_cwd: Optional[Path] = None,
     include_routines: bool = False,
+    exclude_session_ids: Optional[set[str]] = None,
 ) -> List[SessionInfo]:
     """Find sessions matching a natural-language ``query``, newest first.
 
@@ -321,6 +322,12 @@ def search_sessions(
     Routines (scheduled-task transcripts) are excluded by default. Pass
     ``include_routines=True`` to include them.
 
+    ``exclude_session_ids`` filters out specific sessions before scoring.
+    Used by the bot to skip its own currently-active session — which would
+    otherwise dominate search because it accumulates everything the user
+    types (e.g., the word "wesco" lands in the bot's transcript as soon as
+    the user runs ``/use wesco``).
+
     Returns at most ``limit`` results. An empty token set returns ``[]`` —
     callers must validate before showing "all sessions" via this function.
     """
@@ -335,8 +342,11 @@ def search_sessions(
         include_routines=include_routines,
     )
 
+    excluded = exclude_session_ids or set()
     scored: list[tuple[int, float, SessionInfo]] = []
     for s in candidates:
+        if s.session_id in excluded:
+            continue
         hits = _content_contains_all(s.file_path, tokens)
         if hits == 0:
             continue

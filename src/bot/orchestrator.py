@@ -31,6 +31,7 @@ from telegram.ext import (
 
 from ..claude.sdk_integration import StreamUpdate
 from ..claude.session_discovery import (
+    SessionInfo,
     discover_sessions,
     find_by_prefix,
     search_sessions,
@@ -401,6 +402,14 @@ class MessageOrchestrator:
             CallbackQueryHandler(
                 self._inject_deps(self._agentic_callback),
                 pattern=r"^cd:",
+            )
+        )
+
+        # use: callbacks for tapping a session-id alternate in /use output.
+        app.add_handler(
+            CallbackQueryHandler(
+                self._inject_deps(self._handle_use_callback),
+                pattern=r"^use:",
             )
         )
 
@@ -1846,11 +1855,17 @@ class MessageOrchestrator:
             )
             mode_hint = "prefix"
         else:
+            # Exclude the bot's own currently-active session — it accumulates
+            # everything the user types and would otherwise dominate keyword
+            # search for any topic the user has mentioned in this chat.
+            current_id = context.user_data.get("claude_session_id")
+            excluded = {current_id} if current_id else set()
             matches = search_sessions(
                 query,
                 limit=10,
                 within_cwd=self.settings.approved_directory,
                 include_routines=include_routines,
+                exclude_session_ids=excluded,
             )
             mode_hint = "search"
 
@@ -1882,18 +1897,13 @@ class MessageOrchestrator:
             return
 
         target = matches[0]
-        if target.cwd is None:
-            await update.message.reply_text(
-                f"Session <code>{target.short_id}</code> has no recorded "
-                "working directory — cannot safely resume.",
-                parse_mode="HTML",
-            )
-            return
+        alternates = matches[1:4] if mode_hint == "search" else []
+        await self._resume_session_and_reply(
+            update, context, target, alternates, total_matches=len(matches)
+        )
 
-        context.user_data["claude_session_id"] = target.session_id
-        context.user_data["current_directory"] = target.cwd
-        context.user_data["force_new_session"] = False
-
+    def _format_resume_message(self, target: SessionInfo) -> str:
+        """Build the HTML body for a resume confirmation."""
         try:
             rel = target.cwd.relative_to(self.settings.approved_directory)
             cwd_display = (
@@ -1903,31 +1913,98 @@ class MessageOrchestrator:
             )
         except (ValueError, OSError):
             cwd_display = f"<code>{escape_html(str(target.cwd))}</code>"
-
         snippet = escape_html(target.snippet[:120]) if target.snippet else "(empty)"
-        lines = [
+        return (
             f"Resumed <code>{target.short_id}</code> · {cwd_display} · "
-            f"{target.relative_age()}",
-            f"Last user msg: <i>{snippet}</i>",
-        ]
+            f"{target.relative_age()}\nLast user msg: <i>{snippet}</i>"
+        )
 
-        # If this was a search and there are other plausible matches, surface
-        # them as quick-resume hints so the user can switch with one tap.
-        alternates = matches[1:4] if mode_hint == "search" else []
+    def _build_alternates_keyboard(
+        self, alternates: List[SessionInfo], total_matches: int
+    ) -> Optional[InlineKeyboardMarkup]:
+        """Build inline buttons for switch-to-alternate. Returns None if empty."""
+        if not alternates:
+            return None
+        rows: List[List[InlineKeyboardButton]] = []
+        for m in alternates:
+            tag = "⚙ " if m.is_routine else ""
+            # Telegram button text limit is ~64 chars; trim the snippet.
+            snippet_short = m.snippet[:40].rstrip()
+            label = f"{tag}{m.short_id} · {snippet_short}"[:60]
+            rows.append(
+                [InlineKeyboardButton(label, callback_data=f"use:{m.session_id}")]
+            )
+        if total_matches > len(alternates) + 1:
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        f"…+{total_matches - len(alternates) - 1} more — narrow query",
+                        callback_data="use:noop",
+                    )
+                ]
+            )
+        return InlineKeyboardMarkup(rows)
+
+    async def _resume_session_and_reply(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        target: SessionInfo,
+        alternates: List[SessionInfo],
+        total_matches: int,
+    ) -> None:
+        """Set the active session pointer + reply with confirmation + alternates."""
+        if target.cwd is None:
+            await update.effective_message.reply_text(
+                f"Session <code>{target.short_id}</code> has no recorded "
+                "working directory — cannot safely resume.",
+                parse_mode="HTML",
+            )
+            return
+        context.user_data["claude_session_id"] = target.session_id
+        context.user_data["current_directory"] = target.cwd
+        context.user_data["force_new_session"] = False
+
+        body = self._format_resume_message(target)
         if alternates:
-            lines.append("")
-            lines.append("<i>Or switch to:</i>")
-            for m in alternates:
-                tag = " ⚙" if m.is_routine else ""
-                lines.append(
-                    f"  <code>/use {m.short_id}</code>{tag} "
-                    f"<i>({m.relative_age()})</i> — "
-                    f"{escape_html(m.snippet[:60])}"
-                )
-            if len(matches) > 4:
-                lines.append(f"  <i>…+{len(matches) - 4} more</i>")
+            body += "\n\n<i>Or tap to switch:</i>"
+        kb = self._build_alternates_keyboard(alternates, total_matches)
+        await update.effective_message.reply_text(
+            body, parse_mode="HTML", reply_markup=kb
+        )
 
-        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    async def _handle_use_callback(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle ``use:<session_id>`` taps from /use alternates keyboard."""
+        query = update.callback_query
+        if query is None or not query.data:
+            return
+        await query.answer()
+        target_id = query.data.split(":", 1)[1]
+        if target_id == "noop":
+            return
+        # Look up the session by exact id (prefix match with full id is unique).
+        matches = find_by_prefix(target_id, within_cwd=self.settings.approved_directory)
+        if not matches:
+            await query.message.reply_text(
+                f"Session <code>{target_id[:8]}</code> not found.",
+                parse_mode="HTML",
+            )
+            return
+        target = matches[0]
+        if target.cwd is None:
+            await query.message.reply_text(
+                f"Session <code>{target.short_id}</code> has no recorded cwd.",
+                parse_mode="HTML",
+            )
+            return
+        context.user_data["claude_session_id"] = target.session_id
+        context.user_data["current_directory"] = target.cwd
+        context.user_data["force_new_session"] = False
+        await query.message.reply_text(
+            self._format_resume_message(target), parse_mode="HTML"
+        )
 
     async def _handle_stop_callback(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
