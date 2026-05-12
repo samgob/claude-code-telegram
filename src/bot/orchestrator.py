@@ -406,6 +406,14 @@ class MessageOrchestrator:
         )
 
         # use: callbacks for tapping a session-id alternate in /use output.
+        # Order matters: register use_more first so its more-specific pattern
+        # wins over the broader ``use:`` matcher.
+        app.add_handler(
+            CallbackQueryHandler(
+                self._inject_deps(self._handle_use_more_callback),
+                pattern=r"^use_more$",
+            )
+        )
         app.add_handler(
             CallbackQueryHandler(
                 self._inject_deps(self._handle_use_callback),
@@ -1915,9 +1923,15 @@ class MessageOrchestrator:
             return
 
         target = matches[0]
-        alternates = matches[1:4] if mode_hint == "search" else []
+        # Show up to 7 alternates by default; rest are reachable via "more".
+        default_alts = matches[1:8] if mode_hint == "search" else []
+        remaining = matches[8:] if mode_hint == "search" else []
         await self._resume_session_and_reply(
-            update, context, target, alternates, total_matches=len(matches)
+            update,
+            context,
+            target,
+            default_alts,
+            remaining_ids=[m.session_id for m in remaining],
         )
 
     def _format_resume_message(self, target: SessionInfo) -> str:
@@ -1937,33 +1951,38 @@ class MessageOrchestrator:
             f"{target.relative_age()}\nLast user msg: <i>{snippet}</i>"
         )
 
+    def _make_use_button(self, m: SessionInfo) -> InlineKeyboardButton:
+        """One inline button for switching to session ``m``."""
+        tag = "⚙ " if m.is_routine else ""
+        # Telegram inline-button text limit is 64 bytes; emojis are multi-byte.
+        # Reserve ~12 chars for id+separator (+2 if routine); rest is snippet.
+        reserve = 12 + (2 if m.is_routine else 0)
+        snippet_room = 60 - reserve
+        snippet_short = m.snippet[:snippet_room].rstrip()
+        label = f"{tag}{m.short_id} · {snippet_short}"[:64]
+        return InlineKeyboardButton(label, callback_data=f"use:{m.session_id}")
+
     def _build_alternates_keyboard(
-        self, alternates: List[SessionInfo], total_matches: int
+        self,
+        alternates: List[SessionInfo],
+        remaining_count: int = 0,
     ) -> Optional[InlineKeyboardMarkup]:
-        """Build inline buttons for switch-to-alternate. Returns None if empty."""
-        if not alternates:
+        """Inline buttons for switch-to-alternate + an optional 'more' row.
+
+        ``remaining_count`` is the number of additional matches not shown
+        in ``alternates``; when > 0, an extra row offers to load them.
+        """
+        if not alternates and remaining_count == 0:
             return None
-        rows: List[List[InlineKeyboardButton]] = []
-        for m in alternates:
-            tag = "⚙ " if m.is_routine else ""
-            # Telegram button text limit is ~64 chars; trim the snippet.
-            # Telegram inline-button text limit is ~64 bytes; emojis are
-            # multi-byte. Cap at 60 chars to stay safe with utf-8 overhead.
-            # Reserve ~12 chars for the id + separator (+ optional ⚙ tag);
-            # the rest is snippet.
-            reserve = 12 + (2 if m.is_routine else 0)
-            snippet_room = 60 - reserve
-            snippet_short = m.snippet[:snippet_room].rstrip()
-            label = f"{tag}{m.short_id} · {snippet_short}"[:64]
-            rows.append(
-                [InlineKeyboardButton(label, callback_data=f"use:{m.session_id}")]
-            )
-        if total_matches > len(alternates) + 1:
+        rows: List[List[InlineKeyboardButton]] = [
+            [self._make_use_button(m)] for m in alternates
+        ]
+        if remaining_count > 0:
             rows.append(
                 [
                     InlineKeyboardButton(
-                        f"…+{total_matches - len(alternates) - 1} more — narrow query",
-                        callback_data="use:noop",
+                        f"➕ Show {remaining_count} more",
+                        callback_data="use_more",
                     )
                 ]
             )
@@ -1975,9 +1994,14 @@ class MessageOrchestrator:
         context: ContextTypes.DEFAULT_TYPE,
         target: SessionInfo,
         alternates: List[SessionInfo],
-        total_matches: int,
+        remaining_ids: Optional[List[str]] = None,
     ) -> None:
-        """Set the active session pointer + reply with confirmation + alternates."""
+        """Set the active session pointer + reply with confirmation + alternates.
+
+        ``remaining_ids`` is the list of session_ids that weren't shown as
+        alternates but matched the original search — clicking 'Show N more'
+        on the keyboard expands the message to include them.
+        """
         if target.cwd is None:
             await update.effective_message.reply_text(
                 f"Session <code>{target.short_id}</code> has no recorded "
@@ -1992,10 +2016,20 @@ class MessageOrchestrator:
         body = self._format_resume_message(target)
         if alternates:
             body += "\n\n<i>Or tap to switch:</i>"
-        kb = self._build_alternates_keyboard(alternates, total_matches)
-        await update.effective_message.reply_text(
+        remaining_ids = remaining_ids or []
+        kb = self._build_alternates_keyboard(alternates, len(remaining_ids))
+        sent = await update.effective_message.reply_text(
             body, parse_mode="HTML", reply_markup=kb
         )
+        # Stash the overflow so the "more" callback can resolve it later.
+        if remaining_ids:
+            store = context.user_data.setdefault("_use_more_pending", {})
+            store[sent.message_id] = remaining_ids
+            # Bound the cache so it can't grow without bound across messages.
+            if len(store) > 20:
+                # Drop the oldest tracked message id.
+                oldest = min(store)
+                store.pop(oldest, None)
 
     async def _handle_use_callback(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -2029,6 +2063,51 @@ class MessageOrchestrator:
         await query.message.reply_text(
             self._format_resume_message(target), parse_mode="HTML"
         )
+
+    async def _handle_use_more_callback(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Expand the alternates keyboard with the remaining matches.
+
+        When /use produced more results than the default 7 alternates can fit,
+        we stash the overflow session_ids in ``user_data["_use_more_pending"]``
+        keyed by message_id. Clicking 'Show N more' resolves those ids to
+        fresh SessionInfo records and replaces the keyboard with the full
+        set of buttons.
+        """
+        query = update.callback_query
+        if query is None or query.message is None:
+            return
+        await query.answer()
+        msg_id = query.message.message_id
+        pending = context.user_data.get("_use_more_pending", {}).pop(msg_id, [])
+        if not pending:
+            await query.message.reply_text(
+                "More-matches cache expired — re-run /use to refresh.",
+                parse_mode="HTML",
+            )
+            return
+        # Resolve each id back to a SessionInfo via full-id prefix lookup.
+        more_alternates: List[SessionInfo] = []
+        for sid in pending:
+            hits = find_by_prefix(sid, within_cwd=self.settings.approved_directory)
+            if hits:
+                more_alternates.append(hits[0])
+        # Rebuild keyboard: original alternates were in the message we're
+        # editing, but we don't have them in memory. Simplest UX: replace
+        # the keyboard entirely with the additional buttons. The user already
+        # has the top match resumed; the original 7 alternates are still
+        # visible in the message body above.
+        new_kb = self._build_alternates_keyboard(more_alternates, 0)
+        try:
+            await query.edit_message_reply_markup(reply_markup=new_kb)
+        except Exception as e:
+            # Fallback: send as a follow-up message if edit fails (e.g.
+            # message too old).
+            logger.warning("edit_message_reply_markup failed", error=str(e))
+            await query.message.reply_text(
+                "<i>More matches:</i>", parse_mode="HTML", reply_markup=new_kb
+            )
 
     async def _handle_stop_callback(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
