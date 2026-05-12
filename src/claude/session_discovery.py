@@ -26,6 +26,36 @@ logger = structlog.get_logger()
 DEFAULT_PROJECTS_ROOT = Path.home() / ".claude" / "projects"
 _SNIPPET_MAX = 120
 _SCAN_RECORDS = 80  # how many leading records to scan for cwd + first user msg
+_DEEP_SEARCH_BYTES = 64 * 1024  # cap per-file content scanned for keyword search
+_DEEP_SEARCH_CANDIDATES = 200  # cap sessions inspected during a search
+
+# Words that carry no signal for picking a session, so we drop them from the
+# query before matching. Keep this list small — anything we drop becomes
+# unsearchable.
+_STOPWORDS = frozenset(
+    {
+        "a",
+        "an",
+        "the",
+        "session",
+        "sessions",
+        "claude",
+        "for",
+        "with",
+        "about",
+        "from",
+        "in",
+        "of",
+        "on",
+        "my",
+        "to",
+        "and",
+        "or",
+    }
+)
+
+# Words that signal "prefer the most recent match" rather than ranking by hits.
+_RECENCY_HINTS = frozenset({"latest", "recent", "newest", "last", "yesterday", "today"})
 
 
 @dataclass
@@ -187,3 +217,104 @@ def find_by_prefix(
         limit=500, projects_root=projects_root, within_cwd=within_cwd
     )
     return [s for s in candidates if s.session_id.startswith(prefix)]
+
+
+def _tokenize_query(query: str) -> tuple[list[str], bool]:
+    """Split ``query`` into searchable tokens and detect a recency hint.
+
+    Returns ``(tokens, prefer_latest)``. Tokens are lowercased, deduplicated,
+    stripped of stopwords, and limited to those with at least 2 characters so
+    a query like ``"a 1"`` doesn't trigger a near-empty match.
+    """
+    seen: set[str] = set()
+    tokens: list[str] = []
+    prefer_latest = False
+    for raw in query.lower().split():
+        t = raw.strip(".,!?:;\"'()[]")
+        if not t:
+            continue
+        if t in _RECENCY_HINTS:
+            prefer_latest = True
+            continue
+        if t in _STOPWORDS:
+            continue
+        if len(t) < 2:
+            continue
+        if t in seen:
+            continue
+        seen.add(t)
+        tokens.append(t)
+    return tokens, prefer_latest
+
+
+def _content_contains_all(file_path: Path, tokens: list[str]) -> int:
+    """Count how many of ``tokens`` appear in the (truncated) transcript body.
+
+    Returns the hit count if ALL tokens are present, else 0. The scan is
+    bounded to ``_DEEP_SEARCH_BYTES`` per file so it stays fast on long
+    transcripts. Hit count gives an ordering signal (a session that mentions
+    "wesco" 12 times outranks one that mentions it once).
+    """
+    try:
+        with file_path.open("rb") as f:
+            blob = f.read(_DEEP_SEARCH_BYTES)
+    except OSError:
+        return 0
+    text = blob.decode("utf-8", errors="replace").lower()
+    counts = []
+    for t in tokens:
+        c = text.count(t)
+        if c == 0:
+            return 0
+        counts.append(c)
+    return sum(counts)
+
+
+def search_sessions(
+    query: str,
+    limit: int = 5,
+    projects_root: Path = DEFAULT_PROJECTS_ROOT,
+    within_cwd: Optional[Path] = None,
+) -> List[SessionInfo]:
+    """Find sessions matching a natural-language ``query``.
+
+    The query is tokenized (stopwords + recency hints stripped) and each
+    candidate transcript is scanned for ALL remaining tokens. Results are
+    ranked by ``(prefer_latest, hit_count_desc, mtime_desc)``:
+
+    - if the query carried a recency hint (``latest``, ``most recent``, etc.),
+      results are sorted purely by mtime among token-matching transcripts
+    - otherwise, transcripts with more keyword hits rank higher; ties break
+      newest-first
+
+    Returns at most ``limit`` results. An empty token set returns ``[]`` —
+    callers must validate before showing "all sessions" via this function.
+    """
+    tokens, prefer_latest = _tokenize_query(query)
+    if not tokens:
+        return []
+
+    candidates = discover_sessions(
+        limit=_DEEP_SEARCH_CANDIDATES,
+        projects_root=projects_root,
+        within_cwd=within_cwd,
+    )
+
+    scored: list[tuple[int, float, SessionInfo]] = []
+    for s in candidates:
+        hits = _content_contains_all(s.file_path, tokens)
+        if hits == 0:
+            continue
+        scored.append((hits, s.last_modified.timestamp(), s))
+
+    if prefer_latest:
+        # Relevance floor: if any match has multiple hits, drop incidental
+        # 1-hit matches (avoids "the routine session newest in time that
+        # happened to mention the keyword once" beating a focused session).
+        max_hits = max((h for h, _, _ in scored), default=0)
+        if max_hits >= 2:
+            scored = [t for t in scored if t[0] >= 2]
+        scored.sort(key=lambda x: x[1], reverse=True)
+    else:
+        scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    return [s for _, _, s in scored[:limit]]

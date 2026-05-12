@@ -9,8 +9,10 @@ from pathlib import Path
 
 from src.claude.session_discovery import (
     SessionInfo,
+    _tokenize_query,
     discover_sessions,
     find_by_prefix,
+    search_sessions,
 )
 
 
@@ -255,3 +257,210 @@ def test_session_info_relative_age_buckets():
     assert make(120).relative_age().endswith("m ago")
     assert make(3600 * 2).relative_age().endswith("h ago")
     assert make(86400 * 3).relative_age().endswith("d ago")
+
+
+# --- search_sessions / tokenizer -------------------------------------------
+
+
+def test_tokenize_drops_stopwords_and_short_tokens():
+    tokens, latest = _tokenize_query("the latest wesco session about a poc")
+    # Drops: the, latest (recency), session, about, a — keeps content words
+    assert "wesco" in tokens
+    assert "poc" in tokens
+    assert "the" not in tokens
+    assert "session" not in tokens
+    assert "latest" not in tokens  # consumed as recency hint
+    assert latest is True
+
+
+def test_tokenize_dedups_and_lowercases():
+    tokens, _ = _tokenize_query("Wesco WESCO wesco POC poc")
+    assert tokens == ["wesco", "poc"]
+
+
+def test_tokenize_empty_returns_no_tokens():
+    tokens, latest = _tokenize_query("the a session")
+    assert tokens == []
+    assert latest is False
+
+
+def test_search_finds_keyword_in_first_message(tmp_path):
+    root = tmp_path / "projects"
+    _write_session(
+        root,
+        "-a",
+        "11111111-aaaa-1111-1111-111111111111",
+        cwd="/Users/sam/work",
+        first_user_msg="Help me on the Wesco POC scoring",
+    )
+    _write_session(
+        root,
+        "-a",
+        "22222222-bbbb-2222-2222-222222222222",
+        cwd="/Users/sam/work",
+        first_user_msg="Unrelated question about LexisNexis",
+    )
+    out = search_sessions("wesco", projects_root=root)
+    assert len(out) == 1
+    assert out[0].session_id.startswith("1111")
+
+
+def test_search_requires_all_tokens(tmp_path):
+    """Multi-token query is AND, not OR."""
+    root = tmp_path / "projects"
+    _write_session(
+        root,
+        "-a",
+        "aaaaaaaa-aaaa-1111-1111-111111111111",
+        cwd="/x",
+        first_user_msg="wesco only",
+    )
+    _write_session(
+        root,
+        "-a",
+        "bbbbbbbb-bbbb-2222-2222-222222222222",
+        cwd="/x",
+        first_user_msg="wesco and poc together",
+    )
+    out = search_sessions("wesco poc", projects_root=root)
+    assert len(out) == 1
+    assert out[0].session_id.startswith("bbbb")
+
+
+def test_search_ranks_by_hit_count_when_no_recency_hint(tmp_path):
+    root = tmp_path / "projects"
+    _write_session(
+        root,
+        "-a",
+        "aaaaaaaa-aaaa-1111-1111-111111111111",
+        cwd="/x",
+        first_user_msg="wesco mentioned just once",
+        mtime_offset=-1000,  # older
+    )
+    _write_session(
+        root,
+        "-a",
+        "bbbbbbbb-bbbb-2222-2222-222222222222",
+        cwd="/x",
+        first_user_msg="wesco wesco wesco wesco — heavy mention",
+        mtime_offset=-2000,  # older still
+    )
+    out = search_sessions("wesco", projects_root=root)
+    # Higher hit count wins despite older mtime
+    assert out[0].session_id.startswith("bbbb")
+    assert out[1].session_id.startswith("aaaa")
+
+
+def test_search_recency_hint_filters_incidental_mentions(tmp_path):
+    """With 'latest', a multi-hit older session beats a 1-hit newer one
+    (relevance floor protects against routine sessions that mention the
+    keyword in passing being top-ranked just for being newest)."""
+    root = tmp_path / "projects"
+    _write_session(
+        root,
+        "-a",
+        "aaaaaaaa-aaaa-1111-1111-111111111111",
+        cwd="/x",
+        first_user_msg="wesco wesco wesco mentioned many times",
+        mtime_offset=-1000,  # older but many hits
+    )
+    _write_session(
+        root,
+        "-a",
+        "bbbbbbbb-bbbb-2222-2222-222222222222",
+        cwd="/x",
+        first_user_msg="wesco mentioned once",  # newer but 1 hit
+    )
+    out = search_sessions("latest wesco", projects_root=root)
+    # Newer-1-hit dropped by relevance floor; multi-hit older session wins
+    assert len(out) == 1
+    assert out[0].session_id.startswith("aaaa")
+
+
+def test_search_recency_hint_keeps_singletons_when_no_multi_hits(tmp_path):
+    """If every match is a 1-hit incidental mention, recency still works."""
+    root = tmp_path / "projects"
+    _write_session(
+        root,
+        "-a",
+        "aaaaaaaa-aaaa-1111-1111-111111111111",
+        cwd="/x",
+        first_user_msg="wesco mentioned once",
+        mtime_offset=-1000,
+    )
+    _write_session(
+        root,
+        "-a",
+        "bbbbbbbb-bbbb-2222-2222-222222222222",
+        cwd="/x",
+        first_user_msg="wesco only once here too",
+    )
+    out = search_sessions("latest wesco", projects_root=root)
+    # Both kept; newer first
+    assert len(out) == 2
+    assert out[0].session_id.startswith("bbbb")
+
+
+def test_search_respects_within_cwd(tmp_path):
+    root = tmp_path / "projects"
+    _write_session(
+        root,
+        "-a",
+        "aaaaaaaa-aaaa-1111-1111-111111111111",
+        cwd="/users/sam/work",
+        first_user_msg="wesco in work",
+    )
+    _write_session(
+        root,
+        "-b",
+        "bbbbbbbb-bbbb-2222-2222-222222222222",
+        cwd="/users/sam/personal",
+        first_user_msg="wesco in personal",
+    )
+    out = search_sessions(
+        "wesco", projects_root=root, within_cwd=Path("/users/sam/work")
+    )
+    assert len(out) == 1
+    assert out[0].session_id.startswith("aaaa")
+
+
+def test_search_empty_query_returns_empty(tmp_path):
+    root = tmp_path / "projects"
+    _write_session(
+        root,
+        "-a",
+        "aaaaaaaa-aaaa-1111-1111-111111111111",
+        cwd="/x",
+        first_user_msg="anything",
+    )
+    # Only stopwords + recency hint → no searchable tokens → empty result
+    assert search_sessions("the latest session", projects_root=root) == []
+
+
+def test_search_scans_deep_content_not_just_first_message(tmp_path):
+    """Keyword in a later record should still match (transcript-wide scan)."""
+    root = tmp_path / "projects"
+    project = root / "-a"
+    project.mkdir(parents=True)
+    path = project / "cccccccc-1111-1111-1111-111111111111.jsonl"
+    # First user message is generic; the keyword lives in a later record.
+    with path.open("w") as f:
+        f.write(json.dumps({"type": "system", "cwd": "/x"}) + "\n")
+        f.write(json.dumps({"message": {"role": "user", "content": "hello"}}) + "\n")
+        f.write(
+            json.dumps(
+                {"type": "assistant", "content": "Sure, I'll check Wesco POC accuracy"}
+            )
+            + "\n"
+        )
+    out = search_sessions("wesco", projects_root=root)
+    assert len(out) == 1
+
+
+def test_search_limit_caps_results(tmp_path):
+    root = tmp_path / "projects"
+    for i in range(8):
+        sid = f"{i:08d}-aaaa-1111-1111-111111111111"
+        _write_session(root, "-a", sid, cwd="/x", first_user_msg=f"wesco run {i}")
+    out = search_sessions("wesco", projects_root=root, limit=3)
+    assert len(out) == 3

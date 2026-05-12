@@ -34,6 +34,7 @@ from ..claude.session_discovery import (
     SessionInfo,
     discover_sessions,
     find_by_prefix,
+    search_sessions,
 )
 from ..config.settings import Settings
 from ..projects import PrivateTopicsUnavailableError
@@ -1735,46 +1736,72 @@ class MessageOrchestrator:
     async def agentic_use(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Resume a specific Claude session by id prefix.
+        """Resume a specific Claude session by id prefix OR natural query.
 
-        /use <8-char-prefix>  — switch the current session pointer to that id.
-                                If the session's cwd differs, also switches
-                                the current_directory so the next message
-                                resumes correctly.
+        /use <id-prefix>       — exact prefix routing (8-char hex prefix typical)
+        /use latest wesco      — keyword search across recent transcripts
+        /use the lexisnexis    — natural language; stopwords + recency hints
+                                 are stripped automatically
+
+        The router picks prefix-mode when the argument looks like a hex id
+        fragment (4+ chars, hex only). Anything else goes through keyword
+        search. When the search resolves to a single candidate, the session
+        is resumed immediately; otherwise a short disambiguation list is
+        returned.
         """
-        args = update.message.text.split()[1:] if update.message.text else []
-        if not args:
+        if not update.message.text:
+            return
+        # Everything after the command is the query (preserve spaces).
+        raw_after = update.message.text.split(maxsplit=1)
+        if len(raw_after) < 2 or not raw_after[1].strip():
             await update.message.reply_text(
-                "Usage: <code>/use &lt;id-prefix&gt;</code> "
-                "(see <code>/sessions</code>)",
+                "Usage:\n"
+                "  <code>/use &lt;id-prefix&gt;</code> — exact id (4+ hex chars)\n"
+                "  <code>/use latest wesco</code> — keyword search\n\n"
+                "See <code>/sessions</code> to browse.",
                 parse_mode="HTML",
             )
             return
+        query = raw_after[1].strip()
 
-        prefix = args[0].strip().lower()
-        if len(prefix) < 4:
-            await update.message.reply_text(
-                "Prefix too short — use at least 4 characters."
+        # Route: hex prefix vs natural-language query.
+        is_prefix = (
+            len(query.split()) == 1
+            and len(query) >= 4
+            and re.fullmatch(r"[0-9a-fA-F-]+", query) is not None
+        )
+
+        if is_prefix:
+            matches = find_by_prefix(
+                query.lower(), within_cwd=self.settings.approved_directory
             )
-            return
+            mode_hint = "prefix"
+        else:
+            matches = search_sessions(
+                query, limit=10, within_cwd=self.settings.approved_directory
+            )
+            mode_hint = "search"
 
-        matches = find_by_prefix(prefix, within_cwd=self.settings.approved_directory)
         if not matches:
             await update.message.reply_text(
-                f"No session matches <code>{escape_html(prefix)}</code> "
-                "under the approved directory.",
+                f"No session matches <code>{escape_html(query)}</code> "
+                f"({mode_hint}) under the approved directory.",
                 parse_mode="HTML",
             )
             return
+
         if len(matches) > 1:
             preview = "\n".join(
-                f"  <code>{m.short_id}</code> — {escape_html(m.snippet[:60])}"
+                f"  <code>{m.short_id}</code> "
+                f"<i>({m.relative_age()})</i> — "
+                f"{escape_html(m.snippet[:70])}"
                 for m in matches[:5]
             )
             more = f"\n  …+{len(matches) - 5} more" if len(matches) > 5 else ""
             await update.message.reply_text(
-                f"Ambiguous prefix — {len(matches)} matches:\n{preview}{more}\n"
-                "Use a longer prefix.",
+                f"Ambiguous query ({mode_hint}) — {len(matches)} matches:\n"
+                f"{preview}{more}\n"
+                "Tighten the query or use the id prefix.",
                 parse_mode="HTML",
             )
             return
