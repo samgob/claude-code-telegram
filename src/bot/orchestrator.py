@@ -31,7 +31,6 @@ from telegram.ext import (
 
 from ..claude.sdk_integration import StreamUpdate
 from ..claude.session_discovery import (
-    SessionInfo,
     discover_sessions,
     find_by_prefix,
     search_sessions,
@@ -329,6 +328,7 @@ class MessageOrchestrator:
         # Commands
         handlers = [
             ("start", self.agentic_start),
+            ("help", self.agentic_help),
             ("new", self.agentic_new),
             ("status", self.agentic_status),
             ("verbose", self.agentic_verbose),
@@ -464,6 +464,7 @@ class MessageOrchestrator:
         if self.settings.agentic_mode:
             commands = [
                 BotCommand("start", "Start the bot"),
+                BotCommand("help", "Show available commands"),
                 BotCommand("new", "Start a fresh session"),
                 BotCommand("status", "Show session status"),
                 BotCommand("verbose", "Set output verbosity (0/1/2)"),
@@ -549,6 +550,31 @@ class MessageOrchestrator:
             f"Working in: {dir_display}\n"
             f"Commands: /new (reset) · /status"
             f"{sync_line}",
+            parse_mode="HTML",
+        )
+
+    async def agentic_help(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Show the agentic-mode command list."""
+        current_dir = context.user_data.get(
+            "current_directory", self.settings.approved_directory
+        )
+        await update.message.reply_text(
+            "<b>Commands</b>\n"
+            "<code>/new</code> — start a fresh session\n"
+            "<code>/status</code> — current session + cost\n"
+            "<code>/verbose 0|1|2</code> — output detail\n"
+            "<code>/repo [name]</code> — list / switch workspace\n"
+            "<code>/sessions [N] [--all]</code> — recent sessions "
+            "(<code>--all</code> includes routine runs, tagged ⚙)\n"
+            "<code>/use &lt;id-prefix-or-query&gt;</code> — resume a session\n"
+            "  • <code>/use wesco</code> — keyword search, recency-first\n"
+            "  • <code>/use 1ae3935e</code> — exact id prefix\n"
+            "  • <code>/use --all latest samsung</code> — include routines\n"
+            "<code>/restart</code> — restart the bot\n\n"
+            f"Working in: <code>{escape_html(str(current_dir))}/</code>\n"
+            "Anything else continues your current session.",
             parse_mode="HTML",
         )
 
@@ -1682,6 +1708,12 @@ class MessageOrchestrator:
 
     # --- Session listing / arbitrary resume ---------------------------------
 
+    # Synonyms for the "include routines" flag. iOS Telegram silently rewrites
+    # ``--`` to an em-dash (``—``) in many cases, so we accept several forms.
+    _ALL_FLAG_TOKENS: frozenset[str] = frozenset(
+        {"--all", "--routines", "-a", "—all", "—routines", "–all", "–routines"}
+    )
+
     async def agentic_sessions(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
@@ -1694,7 +1726,7 @@ class MessageOrchestrator:
         """
         args = update.message.text.split()[1:] if update.message.text else []
         include_routines = False
-        if args and args[0] in ("--all", "--routines", "-a"):
+        if args and args[0] in self._ALL_FLAG_TOKENS:
             include_routines = True
             args = args[1:]
         limit = 10
@@ -1784,10 +1816,11 @@ class MessageOrchestrator:
             return
         query = raw_after[1].strip()
 
-        # Strip a leading --all / --routines / -a flag.
+        # Strip a leading --all / --routines / -a flag (incl. em-dash variants
+        # that iOS keyboards autocorrect ``--`` to).
         include_routines = False
         first_tok = query.split(maxsplit=1)[0] if query else ""
-        if first_tok in ("--all", "--routines", "-a"):
+        if first_tok in self._ALL_FLAG_TOKENS:
             include_routines = True
             remainder = query.split(maxsplit=1)
             query = remainder[1].strip() if len(remainder) > 1 else ""
@@ -1829,7 +1862,11 @@ class MessageOrchestrator:
             )
             return
 
-        if len(matches) > 1:
+        # If multiple matches with id-prefix mode, that's genuine ambiguity:
+        # the user typed an id, we shouldn't guess which longer id they meant.
+        # For search mode, multiple matches is expected — we resume the top
+        # (most-recent, post-relevance-floor) and surface alternates inline.
+        if mode_hint == "prefix" and len(matches) > 1:
             preview = "\n".join(
                 f"  <code>{m.short_id}</code>{' ⚙' if m.is_routine else ''} "
                 f"<i>({m.relative_age()})</i> — "
@@ -1838,9 +1875,8 @@ class MessageOrchestrator:
             )
             more = f"\n  …+{len(matches) - 5} more" if len(matches) > 5 else ""
             await update.message.reply_text(
-                f"Ambiguous query ({mode_hint}) — {len(matches)} matches:\n"
-                f"{preview}{more}\n"
-                "Tighten the query or use the id prefix.",
+                f"Ambiguous id prefix — {len(matches)} matches:\n"
+                f"{preview}{more}\nUse a longer prefix.",
                 parse_mode="HTML",
             )
             return
@@ -1869,11 +1905,29 @@ class MessageOrchestrator:
             cwd_display = f"<code>{escape_html(str(target.cwd))}</code>"
 
         snippet = escape_html(target.snippet[:120]) if target.snippet else "(empty)"
-        await update.message.reply_text(
+        lines = [
             f"Resumed <code>{target.short_id}</code> · {cwd_display} · "
-            f"{target.relative_age()}\nLast user msg: <i>{snippet}</i>",
-            parse_mode="HTML",
-        )
+            f"{target.relative_age()}",
+            f"Last user msg: <i>{snippet}</i>",
+        ]
+
+        # If this was a search and there are other plausible matches, surface
+        # them as quick-resume hints so the user can switch with one tap.
+        alternates = matches[1:4] if mode_hint == "search" else []
+        if alternates:
+            lines.append("")
+            lines.append("<i>Or switch to:</i>")
+            for m in alternates:
+                tag = " ⚙" if m.is_routine else ""
+                lines.append(
+                    f"  <code>/use {m.short_id}</code>{tag} "
+                    f"<i>({m.relative_age()})</i> — "
+                    f"{escape_html(m.snippet[:60])}"
+                )
+            if len(matches) > 4:
+                lines.append(f"  <i>…+{len(matches) - 4} more</i>")
+
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
     async def _handle_stop_callback(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
