@@ -2093,12 +2093,18 @@ class MessageOrchestrator:
             hits = find_by_prefix(sid, within_cwd=self.settings.approved_directory)
             if hits:
                 more_alternates.append(hits[0])
-        # Rebuild keyboard: original alternates were in the message we're
-        # editing, but we don't have them in memory. Simplest UX: replace
-        # the keyboard entirely with the additional buttons. The user already
-        # has the top match resumed; the original 7 alternates are still
-        # visible in the message body above.
-        new_kb = self._build_alternates_keyboard(more_alternates, 0)
+        # Append to the existing keyboard rather than replace it, so the
+        # original alternates stay tappable. Strip the previous "Show N more"
+        # row first (callback_data == "use_more") before adding new rows.
+        existing_rows: List[List[InlineKeyboardButton]] = []
+        if query.message.reply_markup is not None:
+            for row in query.message.reply_markup.inline_keyboard:
+                if len(row) == 1 and row[0].callback_data == "use_more":
+                    continue
+                existing_rows.append(list(row))
+        for m in more_alternates:
+            existing_rows.append([self._make_use_button(m)])
+        new_kb = InlineKeyboardMarkup(existing_rows) if existing_rows else None
         try:
             await query.edit_message_reply_markup(reply_markup=new_kb)
         except Exception as e:
