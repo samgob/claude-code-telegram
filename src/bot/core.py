@@ -8,10 +8,13 @@ Features:
 """
 
 import asyncio
+import os
+import time
 from typing import Any, Callable, Dict, Optional
 
 import structlog
 from telegram import Update
+from telegram.error import Conflict
 from telegram.ext import (
     AIORateLimiter,
     Application,
@@ -28,6 +31,21 @@ from .orchestrator import MessageOrchestrator
 
 logger = structlog.get_logger()
 
+# Where the polling loop stamps a liveness heartbeat. An external watchdog reads
+# this file's age to detect a fully hung event loop (a failure the in-process
+# Conflict guard below cannot see, because that guard relies on the loop running).
+HEARTBEAT_FILE = os.environ.get(
+    "TELEGRAM_BOT_HEARTBEAT_FILE", "/tmp/telegram-bot-heartbeat"
+)
+
+# A getUpdates Conflict means a second bot instance grabbed our polling slot.
+# In python-telegram-bot the updater retries this forever WITHOUT exiting and
+# WITHOUT flipping `updater.running` to False, so the process becomes a zombie
+# (alive but never delivering messages). We count consecutive Conflicts and, past
+# this threshold within the time window, exit so launchd's KeepAlive restarts us.
+POLL_CONFLICT_EXIT_THRESHOLD = 3
+POLL_CONFLICT_WINDOW_SECONDS = 120
+
 
 class ClaudeCodeBot:
     """Main bot orchestrator."""
@@ -40,6 +58,9 @@ class ClaudeCodeBot:
         self.is_running = False
         self.feature_registry: Optional[FeatureRegistry] = None
         self.orchestrator = MessageOrchestrator(settings, dependencies)
+        # Zombie-poller guard state (see POLL_CONFLICT_* constants).
+        self._poll_conflict_count = 0
+        self._last_poll_conflict = 0.0
 
     async def initialize(self) -> None:
         """Initialize bot application. Idempotent — safe to call multiple times."""
@@ -228,10 +249,14 @@ class ClaudeCodeBot:
                 await self.app.updater.start_polling(
                     allowed_updates=Update.ALL_TYPES,
                     drop_pending_updates=True,
+                    error_callback=self._on_polling_error,
                 )
 
-                # Keep running until manually stopped
+                # Keep running until manually stopped. Stamp a heartbeat each cycle
+                # so an external watchdog can detect a fully hung event loop; the
+                # _on_polling_error guard handles the poller-died-but-loop-alive case.
                 while self.is_running:
+                    self._write_heartbeat()
                     await asyncio.sleep(1)
         except Exception as e:
             logger.error("Error running bot", error=str(e))
@@ -267,6 +292,56 @@ class ClaudeCodeBot:
         except Exception as e:
             logger.error("Error stopping bot", error=str(e))
             raise ClaudeCodeTelegramError(f"Failed to stop bot: {str(e)}") from e
+
+    def _write_heartbeat(self) -> None:
+        """Stamp the heartbeat file with the current time.
+
+        Best-effort: a heartbeat write must never take the bot down, so any
+        filesystem error is logged at debug level and swallowed.
+        """
+        try:
+            with open(HEARTBEAT_FILE, "w") as fh:
+                fh.write(str(int(time.time())))
+        except OSError as exc:  # pragma: no cover - defensive
+            logger.debug("Heartbeat write failed", error=str(exc))
+
+    def _on_polling_error(self, exc: Exception) -> None:
+        """Updater error callback for get_updates failures.
+
+        Fires on the actual failure signal (a Conflict from a competing
+        getUpdates consumer) rather than on a proxy like ``updater.running``,
+        which does NOT change in this failure mode. After repeated Conflicts
+        within the window we stop the run loop so the process exits cleanly and
+        launchd's KeepAlive restarts a fresh, healthy poller.
+        """
+        if not isinstance(exc, Conflict):
+            # Any non-Conflict error means we are not in the zombie scenario;
+            # let PTB's own retry logic handle it and reset the counter.
+            self._poll_conflict_count = 0
+            return
+
+        now = time.monotonic()
+        if now - self._last_poll_conflict > POLL_CONFLICT_WINDOW_SECONDS:
+            # Too long since the last Conflict — treat this as a fresh streak.
+            self._poll_conflict_count = 0
+        self._last_poll_conflict = now
+        self._poll_conflict_count += 1
+
+        logger.error(
+            "getUpdates Conflict — another bot instance is polling this token",
+            consecutive_conflicts=self._poll_conflict_count,
+            threshold=POLL_CONFLICT_EXIT_THRESHOLD,
+        )
+
+        if self._poll_conflict_count >= POLL_CONFLICT_EXIT_THRESHOLD:
+            logger.critical(
+                "Persistent polling Conflict — exiting for launchd restart",
+                consecutive_conflicts=self._poll_conflict_count,
+            )
+            # Break the run loop in start(); run_application()'s finally block
+            # then runs bot.stop() + storage.close() for a clean shutdown, and
+            # the process exit triggers a KeepAlive restart.
+            self.is_running = False
 
     async def _error_handler(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
