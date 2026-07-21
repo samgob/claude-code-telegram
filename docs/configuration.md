@@ -46,6 +46,25 @@ ENABLE_TOKEN_AUTH=false
 AUTH_TOKEN_SECRET=your-secret-key-here
 ```
 
+#### Group Chat Support
+
+```bash
+# Comma-separated Telegram group chat IDs the bot serves (group IDs are negative)
+GROUP_CHAT_IDS=-1001234567890
+
+# Optional Claude model override for group-chat sessions (DMs use CLAUDE_MODEL)
+GROUP_CHAT_MODEL=claude-opus-4-8
+```
+
+All members of an allowlisted group share ONE Claude session per group; each
+user turn is prefixed with the sender's first name (e.g. `[Sam]: ...`) so
+Claude can track who is speaking. A group message is only processed when the
+group is in `GROUP_CHAT_IDS` **and** the sender is in `ALLOWED_USERS` — an
+unauthorized sender in an allowlisted group gets a single reply containing
+their user id (also logged at INFO) so the admin can add them. Messages in
+any other group are silently ignored. Disable BotFather privacy mode so the
+bot receives all group messages.
+
 #### Security Relaxation (Trusted Environments Only)
 
 ```bash
