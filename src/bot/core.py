@@ -204,9 +204,13 @@ class ClaudeCodeBot:
             ):
                 allowed_groups = self.settings.group_chat_ids or []
                 if chat.id not in allowed_groups:
-                    logger.debug(
+                    # INFO on purpose: after adding the bot to a new group,
+                    # this log line is how the admin discovers the chat id
+                    # to put in GROUP_CHAT_IDS.
+                    logger.info(
                         "Ignoring update from non-allowlisted group chat",
                         chat_id=chat.id,
+                        chat_title=getattr(chat, "title", None),
                         middleware=middleware_func.__name__,
                     )
                     raise ApplicationHandlerStop
