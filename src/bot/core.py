@@ -194,6 +194,23 @@ class ClaudeCodeBot:
                 )
                 raise ApplicationHandlerStop
 
+            # Silently ignore group-chat updates from groups that are not on
+            # the allowlist. This runs before any middleware that could reply,
+            # so the bot never responds in a group it wasn't invited to serve.
+            chat = update.effective_chat
+            if chat is not None and getattr(chat, "type", None) in (
+                "group",
+                "supergroup",
+            ):
+                allowed_groups = self.settings.group_chat_ids or []
+                if chat.id not in allowed_groups:
+                    logger.debug(
+                        "Ignoring update from non-allowlisted group chat",
+                        chat_id=chat.id,
+                        middleware=middleware_func.__name__,
+                    )
+                    raise ApplicationHandlerStop
+
             # Inject dependencies into context
             for key, value in self.deps.items():
                 context.bot_data[key] = value

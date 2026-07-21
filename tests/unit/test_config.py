@@ -73,6 +73,58 @@ def test_allowed_users_parsing_with_spaces():
         assert settings.allowed_users == [123, 456, 789]
 
 
+def test_group_chat_settings_defaults():
+    """Group chat settings should default to disabled."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        settings = Settings(
+            telegram_bot_token="test_token",
+            telegram_bot_username="test_bot",
+            approved_directory=tmp_dir,
+        )
+
+        assert settings.group_chat_ids is None
+        assert settings.group_chat_model is None
+
+
+def test_group_chat_ids_parsing():
+    """Test parsing of comma-separated (negative) group chat IDs."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        settings = Settings(
+            telegram_bot_token="test_token",
+            telegram_bot_username="test_bot",
+            approved_directory=tmp_dir,
+            group_chat_ids="-1001234567890, -987654321",
+        )
+
+        assert settings.group_chat_ids == [-1001234567890, -987654321]
+
+
+def test_group_chat_ids_single_int():
+    """A single integer value should be wrapped in a list."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        settings = Settings(
+            telegram_bot_token="test_token",
+            telegram_bot_username="test_bot",
+            approved_directory=tmp_dir,
+            group_chat_ids=-1001234567890,
+        )
+
+        assert settings.group_chat_ids == [-1001234567890]
+
+
+def test_group_chat_model_setting():
+    """Group chat model override should pass through unchanged."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        settings = Settings(
+            telegram_bot_token="test_token",
+            telegram_bot_username="test_bot",
+            approved_directory=tmp_dir,
+            group_chat_model="claude-opus-4-8",
+        )
+
+        assert settings.group_chat_model == "claude-opus-4-8"
+
+
 def test_security_relaxation_settings_defaults_and_overrides():
     """Security relaxation settings should default to False and be configurable."""
     with tempfile.TemporaryDirectory() as tmp_dir:

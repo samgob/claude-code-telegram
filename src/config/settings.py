@@ -55,6 +55,23 @@ class Settings(BaseSettings):
         None, description="Secret for auth tokens"
     )
 
+    # Group chat support
+    group_chat_ids: Optional[List[int]] = Field(
+        None,
+        description=(
+            "Telegram group chat IDs the bot serves (comma-separated; "
+            "group IDs are negative). Messages in any other group are ignored. "
+            "Group members must also be in allowed_users."
+        ),
+    )
+    group_chat_model: Optional[str] = Field(
+        None,
+        description=(
+            "Claude model override for group-chat sessions "
+            "(e.g. claude-opus-4-8). DM sessions use claude_model."
+        ),
+    )
+
     # Security relaxation (for trusted environments)
     disable_security_patterns: bool = Field(
         False,
@@ -334,7 +351,9 @@ class Settings(BaseSettings):
         env_file=".env", env_file_encoding="utf-8", case_sensitive=False, extra="ignore"
     )
 
-    @field_validator("allowed_users", "notification_chat_ids", mode="before")
+    @field_validator(
+        "allowed_users", "notification_chat_ids", "group_chat_ids", mode="before"
+    )
     @classmethod
     def parse_int_list(cls, v: Any) -> Optional[List[int]]:
         """Parse comma-separated integer lists."""
