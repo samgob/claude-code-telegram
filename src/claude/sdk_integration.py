@@ -277,8 +277,13 @@ class ClaudeSDKManager:
         stream_callback: Optional[Callable[[StreamUpdate], None]] = None,
         interrupt_event: Optional[asyncio.Event] = None,
         images: Optional[List[Dict[str, str]]] = None,
+        model: Optional[str] = None,
     ) -> ClaudeResponse:
-        """Execute Claude Code command via SDK."""
+        """Execute Claude Code command via SDK.
+
+        ``model`` overrides the configured default model for this call only
+        (used e.g. for group-chat sessions via GROUP_CHAT_MODEL).
+        """
         start_time = asyncio.get_event_loop().time()
 
         logger.info(
@@ -286,6 +291,7 @@ class ClaudeSDKManager:
             working_directory=str(working_directory),
             session_id=session_id,
             continue_session=continue_session,
+            model_override=model,
         )
 
         try:
@@ -321,7 +327,7 @@ class ClaudeSDKManager:
             # Build Claude Agent options
             options = ClaudeAgentOptions(
                 max_turns=self.config.claude_max_turns,
-                model=self.config.claude_model or None,
+                model=model or self.config.claude_model or None,
                 max_budget_usd=self.config.claude_max_cost_per_request,
                 cwd=str(working_directory),
                 allowed_tools=sdk_allowed_tools,

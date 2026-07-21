@@ -1229,11 +1229,19 @@ async def _generate_placeholder_response(
 
 
 def _update_working_directory_from_claude_response(
-    claude_response, context, settings, user_id
+    claude_response, context, settings, user_id, state=None
 ):
-    """Update the working directory based on Claude's response content."""
+    """Update the working directory based on Claude's response content.
+
+    ``state`` is the mapping holding conversation state — defaults to
+    ``context.user_data`` (DM behavior); group chats pass their shared
+    ``chat_data`` mapping instead.
+    """
     import re
     from pathlib import Path
+
+    if state is None:
+        state = context.user_data
 
     # Look for directory changes in Claude's response
     # This searches for common patterns that indicate directory changes
@@ -1245,9 +1253,7 @@ def _update_working_directory_from_claude_response(
     ]
 
     content = claude_response.content.lower()
-    current_dir = context.user_data.get(
-        "current_directory", settings.approved_directory
-    )
+    current_dir = state.get("current_directory", settings.approved_directory)
 
     for pattern in patterns:
         matches = re.findall(pattern, content, re.MULTILINE | re.IGNORECASE)
@@ -1271,7 +1277,7 @@ def _update_working_directory_from_claude_response(
                     new_path.is_relative_to(settings.approved_directory)
                     and new_path.exists()
                 ):
-                    context.user_data["current_directory"] = new_path
+                    state["current_directory"] = new_path
                     logger.info(
                         "Updated working directory from Claude response",
                         old_dir=str(current_dir),

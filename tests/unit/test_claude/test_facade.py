@@ -294,3 +294,48 @@ class TestEmptySessionIdWarning:
 
         # Session ID should be empty on the response
         assert not result.session_id
+
+
+class TestModelOverridePassthrough:
+    """Verify per-call model override reaches the SDK manager."""
+
+    async def test_model_override_forwarded_to_sdk(self, facade):
+        """run_command(model=...) is passed through to execute_command."""
+        from unittest.mock import AsyncMock
+
+        project = Path("/test/project")
+        facade.sdk_manager.execute_command = AsyncMock(
+            return_value=_make_mock_response()
+        )
+
+        await facade.run_command(
+            prompt="hello",
+            working_directory=project,
+            user_id=-1001234567890,  # group chat id as session owner
+            session_id=None,
+            force_new=True,
+            model="claude-opus-4-8",
+        )
+
+        kwargs = facade.sdk_manager.execute_command.call_args.kwargs
+        assert kwargs["model"] == "claude-opus-4-8"
+
+    async def test_model_defaults_to_none(self, facade):
+        """Without an override, model=None is passed (SDK uses config default)."""
+        from unittest.mock import AsyncMock
+
+        project = Path("/test/project")
+        facade.sdk_manager.execute_command = AsyncMock(
+            return_value=_make_mock_response()
+        )
+
+        await facade.run_command(
+            prompt="hello",
+            working_directory=project,
+            user_id=123,
+            session_id=None,
+            force_new=True,
+        )
+
+        kwargs = facade.sdk_manager.execute_command.call_args.kwargs
+        assert kwargs["model"] is None

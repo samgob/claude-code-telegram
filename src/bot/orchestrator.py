@@ -10,7 +10,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, cast
 
 import structlog
 from telegram import (
@@ -141,6 +141,68 @@ class MessageOrchestrator:
         self.deps = deps
         self._active_requests: Dict[int, ActiveRequest] = {}
         self._known_commands: frozenset[str] = frozenset()
+
+    # --- Group-chat support -------------------------------------------------
+    #
+    # In allowlisted group chats, all members share ONE Claude session per
+    # group: session state lives in context.chat_data (keyed by chat id)
+    # instead of context.user_data (keyed by user id), and the Claude session
+    # store uses the (negative) chat id as the owner id. DM behavior is
+    # unchanged — for private chats these helpers return the user-scoped
+    # values the code always used.
+
+    _GROUP_CHAT_TYPES = ("group", "supergroup")
+
+    @classmethod
+    def _is_group_chat(cls, update: Update) -> bool:
+        """Return True when the update comes from a group/supergroup chat."""
+        chat = update.effective_chat
+        return chat is not None and getattr(chat, "type", None) in (
+            cls._GROUP_CHAT_TYPES
+        )
+
+    def _session_state(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> Dict[str, Any]:
+        """Mapping that holds conversation/session state for this update.
+
+        Group chats share state via chat_data (one session per group);
+        private chats keep the historical per-user state in user_data.
+        """
+        if self._is_group_chat(update) and context.chat_data is not None:
+            return cast(Dict[str, Any], context.chat_data)
+        return cast(Dict[str, Any], context.user_data)
+
+    def _session_owner_id(self, update: Update) -> int:
+        """Owner id for Claude session persistence/auto-resume.
+
+        The chat id (negative) for group chats — so every member resumes the
+        same session — and the user id for DMs.
+        """
+        if self._is_group_chat(update) and update.effective_chat is not None:
+            return update.effective_chat.id
+        return update.effective_user.id
+
+    def _attribute_sender(self, update: Update, prompt: Optional[str]) -> str:
+        """Prefix group-chat prompts with the sender's name for Claude.
+
+        Lets Claude track who is speaking in a shared session, e.g.
+        "[Sam]: ..." / "[V]: ...". DM prompts are passed through unchanged.
+        """
+        text = prompt or ""
+        if not self._is_group_chat(update):
+            return text
+        user = update.effective_user
+        name = None
+        if user is not None:
+            name = user.first_name or user.username or str(user.id)
+        return f"[{name or 'Unknown'}]: {text}"
+
+    def _model_override(self, update: Update) -> Optional[str]:
+        """Per-call Claude model override: GROUP_CHAT_MODEL in groups only."""
+        if self._is_group_chat(update):
+            return self.settings.group_chat_model
+        return None
 
     def _inject_deps(self, handler: Callable) -> Callable:  # type: ignore[type-arg]
         """Wrap handler to inject dependencies into context.bot_data."""
@@ -555,7 +617,7 @@ class MessageOrchestrator:
                     return
                 except Exception:
                     sync_line = "\n\n🧵 Topic sync failed. Run /sync_threads to retry."
-        current_dir = context.user_data.get(
+        current_dir = self._session_state(update, context).get(
             "current_directory", self.settings.approved_directory
         )
         dir_display = f"<code>{current_dir}/</code>"
@@ -574,7 +636,7 @@ class MessageOrchestrator:
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         """Show the agentic-mode command list."""
-        current_dir = context.user_data.get(
+        current_dir = self._session_state(update, context).get(
             "current_directory", self.settings.approved_directory
         )
         await update.message.reply_text(
@@ -599,9 +661,10 @@ class MessageOrchestrator:
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         """Reset session, one-line confirmation."""
-        context.user_data["claude_session_id"] = None
-        context.user_data["session_started"] = True
-        context.user_data["force_new_session"] = True
+        state = self._session_state(update, context)
+        state["claude_session_id"] = None
+        state["session_started"] = True
+        state["force_new_session"] = True
 
         await update.message.reply_text("Session reset. What's next?")
 
@@ -609,12 +672,11 @@ class MessageOrchestrator:
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         """Compact one-line status, no buttons."""
-        current_dir = context.user_data.get(
-            "current_directory", self.settings.approved_directory
-        )
+        state = self._session_state(update, context)
+        current_dir = state.get("current_directory", self.settings.approved_directory)
         dir_display = str(current_dir)
 
-        session_id = context.user_data.get("claude_session_id")
+        session_id = state.get("claude_session_id")
         session_status = "active" if session_id else "none"
 
         # Cost info
@@ -1017,14 +1079,13 @@ class MessageOrchestrator:
             )
             return
 
-        current_dir = context.user_data.get(
-            "current_directory", self.settings.approved_directory
-        )
-        session_id = context.user_data.get("claude_session_id")
+        state = self._session_state(update, context)
+        current_dir = state.get("current_directory", self.settings.approved_directory)
+        session_id = state.get("claude_session_id")
 
         # Check if /new was used — skip auto-resume for this first message.
         # Flag is only cleared after a successful run so retries keep the intent.
-        force_new = bool(context.user_data.get("force_new_session"))
+        force_new = bool(state.get("force_new_session"))
 
         # --- Verbose progress tracking via stream callback ---
         tool_log: List[Dict[str, Any]] = []
@@ -1060,26 +1121,27 @@ class MessageOrchestrator:
         success = True
         try:
             claude_response = await claude_integration.run_command(
-                prompt=message_text,
+                prompt=self._attribute_sender(update, message_text),
                 working_directory=current_dir,
-                user_id=user_id,
+                user_id=self._session_owner_id(update),
                 session_id=session_id,
                 on_stream=on_stream,
                 force_new=force_new,
                 interrupt_event=interrupt_event,
+                model=self._model_override(update),
             )
 
             # New session created successfully — clear the one-shot flag
             if force_new:
-                context.user_data["force_new_session"] = False
+                state["force_new_session"] = False
 
-            context.user_data["claude_session_id"] = claude_response.session_id
+            state["claude_session_id"] = claude_response.session_id
 
             # Track directory changes
             from .handlers.message import _update_working_directory_from_claude_response
 
             _update_working_directory_from_claude_response(
-                claude_response, context, self.settings, user_id
+                claude_response, context, self.settings, user_id, state=state
             )
 
             # Store interaction
@@ -1287,14 +1349,13 @@ class MessageOrchestrator:
             )
             return
 
-        current_dir = context.user_data.get(
-            "current_directory", self.settings.approved_directory
-        )
-        session_id = context.user_data.get("claude_session_id")
+        state = self._session_state(update, context)
+        current_dir = state.get("current_directory", self.settings.approved_directory)
+        session_id = state.get("claude_session_id")
 
         # Check if /new was used — skip auto-resume for this first message.
         # Flag is only cleared after a successful run so retries keep the intent.
-        force_new = bool(context.user_data.get("force_new_session"))
+        force_new = bool(state.get("force_new_session"))
 
         verbose_level = self._get_verbose_level(context)
         tool_log: List[Dict[str, Any]] = []
@@ -1311,23 +1372,24 @@ class MessageOrchestrator:
         heartbeat = self._start_typing_heartbeat(chat)
         try:
             claude_response = await claude_integration.run_command(
-                prompt=prompt,
+                prompt=self._attribute_sender(update, prompt),
                 working_directory=current_dir,
-                user_id=user_id,
+                user_id=self._session_owner_id(update),
                 session_id=session_id,
                 on_stream=on_stream,
                 force_new=force_new,
+                model=self._model_override(update),
             )
 
             if force_new:
-                context.user_data["force_new_session"] = False
+                state["force_new_session"] = False
 
-            context.user_data["claude_session_id"] = claude_response.session_id
+            state["claude_session_id"] = claude_response.session_id
 
             from .handlers.message import _update_working_directory_from_claude_response
 
             _update_working_directory_from_claude_response(
-                claude_response, context, self.settings, user_id
+                claude_response, context, self.settings, user_id, state=state
             )
 
             from .utils.formatting import ResponseFormatter
@@ -1499,11 +1561,10 @@ class MessageOrchestrator:
             )
             return
 
-        current_dir = context.user_data.get(
-            "current_directory", self.settings.approved_directory
-        )
-        session_id = context.user_data.get("claude_session_id")
-        force_new = bool(context.user_data.get("force_new_session"))
+        state = self._session_state(update, context)
+        current_dir = state.get("current_directory", self.settings.approved_directory)
+        session_id = state.get("claude_session_id")
+        force_new = bool(state.get("force_new_session"))
 
         verbose_level = self._get_verbose_level(context)
         tool_log: List[Dict[str, Any]] = []
@@ -1520,26 +1581,27 @@ class MessageOrchestrator:
         heartbeat = self._start_typing_heartbeat(chat)
         try:
             claude_response = await claude_integration.run_command(
-                prompt=prompt,
+                prompt=self._attribute_sender(update, prompt),
                 working_directory=current_dir,
-                user_id=user_id,
+                user_id=self._session_owner_id(update),
                 session_id=session_id,
                 on_stream=on_stream,
                 force_new=force_new,
                 images=images,
+                model=self._model_override(update),
             )
         finally:
             heartbeat.cancel()
 
         if force_new:
-            context.user_data["force_new_session"] = False
+            state["force_new_session"] = False
 
-        context.user_data["claude_session_id"] = claude_response.session_id
+        state["claude_session_id"] = claude_response.session_id
 
         from .handlers.message import _update_working_directory_from_claude_response
 
         _update_working_directory_from_claude_response(
-            claude_response, context, self.settings, user_id
+            claude_response, context, self.settings, user_id, state=state
         )
 
         from .utils.formatting import ResponseFormatter
@@ -1637,7 +1699,8 @@ class MessageOrchestrator:
         """
         args = update.message.text.split()[1:] if update.message.text else []
         base = self.settings.approved_directory
-        current_dir = context.user_data.get("current_directory", base)
+        state = self._session_state(update, context)
+        current_dir = state.get("current_directory", base)
 
         if args:
             # Switch to named repo
@@ -1650,18 +1713,18 @@ class MessageOrchestrator:
                 )
                 return
 
-            context.user_data["current_directory"] = target_path
+            state["current_directory"] = target_path
 
             # Try to find a resumable session
             claude_integration = context.bot_data.get("claude_integration")
             session_id = None
             if claude_integration:
                 existing = await claude_integration._find_resumable_session(
-                    update.effective_user.id, target_path
+                    self._session_owner_id(update), target_path
                 )
                 if existing:
                     session_id = existing.session_id
-            context.user_data["claude_session_id"] = session_id
+            state["claude_session_id"] = session_id
 
             is_git = (target_path / ".git").is_dir()
             git_badge = " (git)" if is_git else ""
@@ -1764,7 +1827,7 @@ class MessageOrchestrator:
             )
             return
 
-        current_id = context.user_data.get("claude_session_id")
+        current_id = self._session_state(update, context).get("claude_session_id")
         lines: List[str] = []
         for s in sessions:
             marker = "● " if s.session_id == current_id else "○ "
@@ -1870,14 +1933,14 @@ class MessageOrchestrator:
             # otherwise dominate keyword search for topics the user discusses
             # via the bot. Query the SDK session manager for the list.
             excluded: set[str] = set()
-            current_id = context.user_data.get("claude_session_id")
+            current_id = self._session_state(update, context).get("claude_session_id")
             if current_id:
                 excluded.add(current_id)
             claude_integration = context.bot_data.get("claude_integration")
             if claude_integration is not None:
                 try:
                     bot_sessions = await claude_integration.get_user_sessions(
-                        update.effective_user.id
+                        self._session_owner_id(update)
                     )
                     excluded.update(s["session_id"] for s in bot_sessions)
                 except Exception as e:
@@ -2009,9 +2072,10 @@ class MessageOrchestrator:
                 parse_mode="HTML",
             )
             return
-        context.user_data["claude_session_id"] = target.session_id
-        context.user_data["current_directory"] = target.cwd
-        context.user_data["force_new_session"] = False
+        state = self._session_state(update, context)
+        state["claude_session_id"] = target.session_id
+        state["current_directory"] = target.cwd
+        state["force_new_session"] = False
 
         body = self._format_resume_message(target)
         if alternates:
@@ -2023,7 +2087,7 @@ class MessageOrchestrator:
         )
         # Stash the overflow so the "more" callback can resolve it later.
         if remaining_ids:
-            store = context.user_data.setdefault("_use_more_pending", {})
+            store = state.setdefault("_use_more_pending", {})
             store[sent.message_id] = remaining_ids
             # Bound the cache so it can't grow without bound across messages.
             if len(store) > 20:
@@ -2057,9 +2121,10 @@ class MessageOrchestrator:
                 parse_mode="HTML",
             )
             return
-        context.user_data["claude_session_id"] = target.session_id
-        context.user_data["current_directory"] = target.cwd
-        context.user_data["force_new_session"] = False
+        state = self._session_state(update, context)
+        state["claude_session_id"] = target.session_id
+        state["current_directory"] = target.cwd
+        state["force_new_session"] = False
         await query.message.reply_text(
             self._format_resume_message(target), parse_mode="HTML"
         )
@@ -2080,7 +2145,8 @@ class MessageOrchestrator:
             return
         await query.answer()
         msg_id = query.message.message_id
-        pending = context.user_data.get("_use_more_pending", {}).pop(msg_id, [])
+        state = self._session_state(update, context)
+        pending = state.get("_use_more_pending", {}).pop(msg_id, [])
         if not pending:
             await query.message.reply_text(
                 "More-matches cache expired — re-run /use to refresh.",
@@ -2166,18 +2232,19 @@ class MessageOrchestrator:
             )
             return
 
-        context.user_data["current_directory"] = new_path
+        state = self._session_state(update, context)
+        state["current_directory"] = new_path
 
         # Look for a resumable session instead of always clearing
         claude_integration = context.bot_data.get("claude_integration")
         session_id = None
         if claude_integration:
             existing = await claude_integration._find_resumable_session(
-                query.from_user.id, new_path
+                self._session_owner_id(update), new_path
             )
             if existing:
                 session_id = existing.session_id
-        context.user_data["claude_session_id"] = session_id
+        state["claude_session_id"] = session_id
 
         is_git = (new_path / ".git").is_dir()
         git_badge = " (git)" if is_git else ""

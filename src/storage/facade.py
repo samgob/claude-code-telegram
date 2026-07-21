@@ -79,6 +79,20 @@ class Storage:
             cost=response.cost,
         )
 
+        # Ensure the sender has a users row (messages/cost tables FK to users).
+        # In group chats the session is owned by the chat id, so a member's
+        # first interaction may arrive before any user record exists for them.
+        if not await self.users.get_user(user_id):
+            await self.users.create_user(
+                UserModel(
+                    user_id=user_id,
+                    telegram_username=None,
+                    first_seen=datetime.now(UTC),
+                    last_active=datetime.now(UTC),
+                    is_allowed=True,
+                )
+            )
+
         # Save message
         message = MessageModel(
             message_id=None,
