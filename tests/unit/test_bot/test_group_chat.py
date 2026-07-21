@@ -35,6 +35,11 @@ def tmp_dir():
         yield Path(d)
 
 
+OWNER_ID = 123  # Sam
+MEMBER_ID = 456  # V
+RESTRICTED_DEFAULT = ["Edit", "Write", "NotebookEdit", "Bash"]
+
+
 @pytest.fixture
 def group_settings(tmp_dir):
     return create_test_config(
@@ -42,6 +47,7 @@ def group_settings(tmp_dir):
         agentic_mode=True,
         group_chat_ids=[GROUP_ID],
         group_chat_model=GROUP_MODEL,
+        group_chat_owner_id=OWNER_ID,
     )
 
 
@@ -472,3 +478,127 @@ class TestGroupModelOverride:
 
         kwargs = claude_integration.run_command.call_args.kwargs
         assert kwargs["model"] is None
+
+
+# --- Phase 2: per-sender tiered permissions -----------------------------------
+
+
+async def _run_text_and_get_kwargs(orchestrator, settings, update):
+    """Run agentic_text with a mocked Claude and return run_command kwargs."""
+    claude_integration = AsyncMock()
+    claude_integration.run_command = AsyncMock(return_value=make_claude_response())
+    update.message.reply_text.return_value = AsyncMock()
+    context = make_context(settings, claude_integration)
+    await orchestrator.agentic_text(update, context)
+    return claude_integration.run_command.call_args.kwargs
+
+
+class TestPerSenderToolGating:
+    """Non-owner group turns get restricted tools disallowed; owner/DMs don't."""
+
+    async def test_owner_group_turn_unrestricted(self, group_settings, deps):
+        orchestrator = MessageOrchestrator(group_settings, deps)
+        update = make_group_update(user_id=OWNER_ID, first_name="Sam")
+
+        kwargs = await _run_text_and_get_kwargs(orchestrator, group_settings, update)
+
+        assert kwargs["disallowed_tools"] is None
+
+    async def test_non_owner_group_turn_restricted(self, group_settings, deps):
+        orchestrator = MessageOrchestrator(group_settings, deps)
+        update = make_group_update(user_id=MEMBER_ID, first_name="V")
+
+        kwargs = await _run_text_and_get_kwargs(orchestrator, group_settings, update)
+
+        assert kwargs["disallowed_tools"] == RESTRICTED_DEFAULT
+
+    async def test_dm_turn_never_restricted(self, group_settings, deps):
+        """Even a non-owner user id is unrestricted in a DM."""
+        orchestrator = MessageOrchestrator(group_settings, deps)
+        update = make_dm_update(user_id=MEMBER_ID)
+
+        kwargs = await _run_text_and_get_kwargs(orchestrator, group_settings, update)
+
+        assert kwargs["disallowed_tools"] is None
+
+    async def test_owner_unset_restricts_everyone(self, tmp_dir, deps):
+        """Fail closed: without GROUP_CHAT_OWNER_ID all group turns restrict."""
+        settings = create_test_config(
+            approved_directory=str(tmp_dir),
+            agentic_mode=True,
+            group_chat_ids=[GROUP_ID],
+        )
+        orchestrator = MessageOrchestrator(settings, deps)
+        update = make_group_update(user_id=OWNER_ID, first_name="Sam")
+
+        kwargs = await _run_text_and_get_kwargs(orchestrator, settings, update)
+
+        assert kwargs["disallowed_tools"] == RESTRICTED_DEFAULT
+
+    async def test_custom_restricted_tools(self, tmp_dir, deps):
+        settings = create_test_config(
+            approved_directory=str(tmp_dir),
+            agentic_mode=True,
+            group_chat_ids=[GROUP_ID],
+            group_chat_owner_id=OWNER_ID,
+            group_chat_restricted_tools=["Bash"],
+        )
+        orchestrator = MessageOrchestrator(settings, deps)
+        update = make_group_update(user_id=MEMBER_ID, first_name="V")
+
+        kwargs = await _run_text_and_get_kwargs(orchestrator, settings, update)
+
+        assert kwargs["disallowed_tools"] == ["Bash"]
+
+
+class TestGroupPolicyPrompt:
+    """Policy appendix is sent on group turns only."""
+
+    async def test_group_turn_appends_default_policy(self, group_settings, deps):
+        orchestrator = MessageOrchestrator(group_settings, deps)
+        update = make_group_update(user_id=OWNER_ID)
+
+        kwargs = await _run_text_and_get_kwargs(orchestrator, group_settings, update)
+
+        policy = kwargs["append_system_prompt"]
+        assert policy is not None
+        assert "shared family chat" in policy
+        assert "[Sam] is the account owner" in policy
+
+    async def test_dm_turn_has_no_policy(self, group_settings, deps):
+        orchestrator = MessageOrchestrator(group_settings, deps)
+        update = make_dm_update(user_id=OWNER_ID)
+
+        kwargs = await _run_text_and_get_kwargs(orchestrator, group_settings, update)
+
+        assert kwargs["append_system_prompt"] is None
+
+    async def test_policy_override(self, tmp_dir, deps):
+        settings = create_test_config(
+            approved_directory=str(tmp_dir),
+            agentic_mode=True,
+            group_chat_ids=[GROUP_ID],
+            group_chat_owner_id=OWNER_ID,
+            group_chat_policy="Custom house rules.",
+        )
+        orchestrator = MessageOrchestrator(settings, deps)
+        update = make_group_update(user_id=MEMBER_ID)
+
+        kwargs = await _run_text_and_get_kwargs(orchestrator, settings, update)
+
+        assert kwargs["append_system_prompt"] == "Custom house rules."
+
+    async def test_empty_policy_disables_appendix(self, tmp_dir, deps):
+        settings = create_test_config(
+            approved_directory=str(tmp_dir),
+            agentic_mode=True,
+            group_chat_ids=[GROUP_ID],
+            group_chat_owner_id=OWNER_ID,
+            group_chat_policy="",
+        )
+        orchestrator = MessageOrchestrator(settings, deps)
+        update = make_group_update(user_id=MEMBER_ID)
+
+        kwargs = await _run_text_and_get_kwargs(orchestrator, settings, update)
+
+        assert kwargs["append_system_prompt"] is None

@@ -366,6 +366,130 @@ class TestClaudeSDKManager:
         assert len(captured_options) == 1
         assert captured_options[0].max_budget_usd == config.claude_max_cost_per_request
 
+    async def test_per_call_disallowed_tools_merged_with_config(self, tmp_path):
+        """Per-call disallowed tools union with the configured disallow list."""
+        config = Settings(
+            telegram_bot_token="test:token",
+            telegram_bot_username="testbot",
+            approved_directory=tmp_path,
+            claude_timeout_seconds=2,
+            claude_disallowed_tools=["WebSearch"],
+        )
+        manager = ClaudeSDKManager(config)
+        captured_options = []
+        mock_factory = _mock_client_factory(
+            _make_assistant_message("ok"),
+            _make_result_message(),
+            capture_options=captured_options,
+        )
+
+        with patch(
+            "src.claude.sdk_integration.ClaudeSDKClient", side_effect=mock_factory
+        ):
+            await manager.execute_command(
+                prompt="[V]: hello",
+                working_directory=tmp_path,
+                disallowed_tools=["Edit", "Bash", "WebSearch"],
+            )
+
+        assert len(captured_options) == 1
+        # Union, config list first, de-duplicated
+        assert captured_options[0].disallowed_tools == [
+            "WebSearch",
+            "Edit",
+            "Bash",
+        ]
+        # Allowed tools untouched; disallowedTools beat allowedTools CLI-side
+        assert "Edit" in captured_options[0].allowed_tools
+
+    async def test_disallowed_tools_apply_even_when_validation_disabled(self, tmp_path):
+        """Per-sender gating holds even with DISABLE_TOOL_VALIDATION=true."""
+        config = Settings(
+            telegram_bot_token="test:token",
+            telegram_bot_username="testbot",
+            approved_directory=tmp_path,
+            claude_timeout_seconds=2,
+            disable_tool_validation=True,
+        )
+        manager = ClaudeSDKManager(config)
+        captured_options = []
+        mock_factory = _mock_client_factory(
+            _make_assistant_message("ok"),
+            _make_result_message(),
+            capture_options=captured_options,
+        )
+
+        with patch(
+            "src.claude.sdk_integration.ClaudeSDKClient", side_effect=mock_factory
+        ):
+            await manager.execute_command(
+                prompt="[V]: hello",
+                working_directory=tmp_path,
+                disallowed_tools=["Bash"],
+            )
+
+        assert captured_options[0].disallowed_tools == ["Bash"]
+
+    async def test_no_per_call_disallowed_tools_keeps_config(self, sdk_manager):
+        """Without a per-call override, config disallow list passes unchanged."""
+        captured_options = []
+        mock_factory = _mock_client_factory(
+            _make_assistant_message("ok"),
+            _make_result_message(),
+            capture_options=captured_options,
+        )
+
+        with patch(
+            "src.claude.sdk_integration.ClaudeSDKClient", side_effect=mock_factory
+        ):
+            await sdk_manager.execute_command(
+                prompt="hello",
+                working_directory=Path("/test"),
+            )
+
+        assert captured_options[0].disallowed_tools == []
+
+    async def test_append_system_prompt_preserves_base(self, sdk_manager):
+        """Policy appendix is appended after the base boundary prompt."""
+        captured_options = []
+        mock_factory = _mock_client_factory(
+            _make_assistant_message("ok"),
+            _make_result_message(),
+            capture_options=captured_options,
+        )
+
+        with patch(
+            "src.claude.sdk_integration.ClaudeSDKClient", side_effect=mock_factory
+        ):
+            await sdk_manager.execute_command(
+                prompt="[V]: hello",
+                working_directory=Path("/test"),
+                append_system_prompt="This is a shared family chat.",
+            )
+
+        system_prompt = captured_options[0].system_prompt
+        assert system_prompt.startswith("All file operations must stay within")
+        assert system_prompt.endswith("This is a shared family chat.")
+
+    async def test_no_appendix_leaves_system_prompt_unchanged(self, sdk_manager):
+        """DM turns: system prompt has no policy text."""
+        captured_options = []
+        mock_factory = _mock_client_factory(
+            _make_assistant_message("ok"),
+            _make_result_message(),
+            capture_options=captured_options,
+        )
+
+        with patch(
+            "src.claude.sdk_integration.ClaudeSDKClient", side_effect=mock_factory
+        ):
+            await sdk_manager.execute_command(
+                prompt="hello",
+                working_directory=Path("/test"),
+            )
+
+        assert "family chat" not in captured_options[0].system_prompt
+
     async def test_execute_command_no_resume_for_new_session(self, sdk_manager):
         """Test that resume is not set for new sessions."""
         captured_options = []

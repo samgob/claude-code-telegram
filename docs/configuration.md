@@ -54,6 +54,16 @@ GROUP_CHAT_IDS=-1001234567890
 
 # Optional Claude model override for group-chat sessions (DMs use CLAUDE_MODEL)
 GROUP_CHAT_MODEL=claude-opus-4-8
+
+# Owner's Telegram user id — owner turns run unrestricted
+GROUP_CHAT_OWNER_ID=123456789
+
+# Tools disallowed on NON-owner group turns (default shown)
+GROUP_CHAT_RESTRICTED_TOOLS=Edit,Write,NotebookEdit,Bash
+
+# Policy appended to the system prompt on group turns (defaults to built-in
+# family-chat rules; set empty to disable)
+GROUP_CHAT_POLICY=
 ```
 
 All members of an allowlisted group share ONE Claude session per group; each
@@ -64,6 +74,17 @@ unauthorized sender in an allowlisted group gets a single reply containing
 their user id (also logged at INFO) so the admin can add them. Messages in
 any other group are silently ignored. Disable BotFather privacy mode so the
 bot receives all group messages.
+
+**Per-sender tiered permissions.** Turns by anyone other than
+`GROUP_CHAT_OWNER_ID` get `GROUP_CHAT_RESTRICTED_TOOLS` passed to
+`ClaudeAgentOptions.disallowed_tools` (a hard gate: the CLI's
+`--disallowedTools` always beats the allowed-tools list, and this gate
+applies even with `DISABLE_TOOL_VALIDATION=true`). If the owner id is
+unset, ALL group turns are restricted (fail closed). Additionally, every
+group turn (owner included) appends `GROUP_CHAT_POLICY` to the system
+prompt — a soft layer telling Claude which topics are shared family
+context vs. owner-only work/sensitive context. DM behavior is untouched
+by both layers.
 
 #### Security Relaxation (Trusted Environments Only)
 

@@ -41,12 +41,17 @@ class ClaudeIntegration:
         interrupt_event: Optional["asyncio.Event"] = None,
         images: Optional[List[Dict[str, str]]] = None,
         model: Optional[str] = None,
+        disallowed_tools: Optional[List[str]] = None,
+        append_system_prompt: Optional[str] = None,
     ) -> ClaudeResponse:
         """Run Claude Code command with full integration.
 
         ``user_id`` is the session owner — the Telegram user id in DMs, or the
         (negative) chat id for shared group-chat sessions. ``model`` optionally
         overrides the configured Claude model for this call.
+        ``disallowed_tools`` adds per-call hard tool restrictions (non-owner
+        group turns); ``append_system_prompt`` appends per-call policy text
+        to the system prompt (group-chat soft policy).
         """
         logger.info(
             "Running Claude command",
@@ -56,6 +61,8 @@ class ClaudeIntegration:
             prompt_length=len(prompt),
             force_new=force_new,
             model_override=model,
+            extra_disallowed_tools=disallowed_tools,
+            has_system_prompt_appendix=bool(append_system_prompt),
         )
 
         # If no session_id provided, try to find an existing session for this
@@ -98,6 +105,8 @@ class ClaudeIntegration:
                     interrupt_event=interrupt_event,
                     images=images,
                     model=model,
+                    disallowed_tools=disallowed_tools,
+                    append_system_prompt=append_system_prompt,
                 )
             except Exception as resume_error:
                 # If resume failed (e.g., session expired/missing on Claude's side),
@@ -125,6 +134,8 @@ class ClaudeIntegration:
                         interrupt_event=interrupt_event,
                         images=images,
                         model=model,
+                        disallowed_tools=disallowed_tools,
+                        append_system_prompt=append_system_prompt,
                     )
                 else:
                     raise
@@ -171,6 +182,8 @@ class ClaudeIntegration:
         interrupt_event: Optional[asyncio.Event] = None,
         images: Optional[List[Dict[str, str]]] = None,
         model: Optional[str] = None,
+        disallowed_tools: Optional[List[str]] = None,
+        append_system_prompt: Optional[str] = None,
     ) -> ClaudeResponse:
         """Execute command via SDK."""
         return await self.sdk_manager.execute_command(
@@ -182,6 +195,8 @@ class ClaudeIntegration:
             interrupt_event=interrupt_event,
             images=images,
             model=model,
+            disallowed_tools=disallowed_tools,
+            append_system_prompt=append_system_prompt,
         )
 
     async def _find_resumable_session(

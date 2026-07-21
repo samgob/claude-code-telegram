@@ -339,3 +339,52 @@ class TestModelOverridePassthrough:
 
         kwargs = facade.sdk_manager.execute_command.call_args.kwargs
         assert kwargs["model"] is None
+
+    async def test_disallowed_tools_and_policy_forwarded_to_sdk(self, facade):
+        """Per-turn tool restrictions + policy appendix reach execute_command."""
+        from unittest.mock import AsyncMock
+
+        project = Path("/test/project")
+        facade.sdk_manager.execute_command = AsyncMock(
+            return_value=_make_mock_response()
+        )
+
+        await facade.run_command(
+            prompt="[V]: hello",
+            working_directory=project,
+            user_id=-1001234567890,
+            session_id=None,
+            force_new=True,
+            disallowed_tools=["Edit", "Write", "NotebookEdit", "Bash"],
+            append_system_prompt="Family chat policy.",
+        )
+
+        kwargs = facade.sdk_manager.execute_command.call_args.kwargs
+        assert kwargs["disallowed_tools"] == [
+            "Edit",
+            "Write",
+            "NotebookEdit",
+            "Bash",
+        ]
+        assert kwargs["append_system_prompt"] == "Family chat policy."
+
+    async def test_disallowed_tools_default_none(self, facade):
+        """Owner/DM turns pass no per-call restrictions or policy."""
+        from unittest.mock import AsyncMock
+
+        project = Path("/test/project")
+        facade.sdk_manager.execute_command = AsyncMock(
+            return_value=_make_mock_response()
+        )
+
+        await facade.run_command(
+            prompt="hello",
+            working_directory=project,
+            user_id=123,
+            session_id=None,
+            force_new=True,
+        )
+
+        kwargs = facade.sdk_manager.execute_command.call_args.kwargs
+        assert kwargs["disallowed_tools"] is None
+        assert kwargs["append_system_prompt"] is None

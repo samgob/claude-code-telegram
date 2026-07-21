@@ -204,6 +204,36 @@ class MessageOrchestrator:
             return self.settings.group_chat_model
         return None
 
+    def _is_group_owner_turn(self, update: Update) -> bool:
+        """True when the group-chat sender is the configured owner.
+
+        If GROUP_CHAT_OWNER_ID is unset, no group turn counts as the
+        owner's (fail closed: everyone restricted).
+        """
+        owner_id = self.settings.group_chat_owner_id
+        user = update.effective_user
+        return owner_id is not None and user is not None and user.id == owner_id
+
+    def _restricted_tools_override(self, update: Update) -> Optional[List[str]]:
+        """Per-call hard tool restrictions for non-owner group turns.
+
+        Returns GROUP_CHAT_RESTRICTED_TOOLS for a group turn by anyone
+        other than the owner; None for owner turns and all DMs (existing
+        behavior). Passed down to ClaudeAgentOptions.disallowed_tools,
+        which always beats the allowed-tools list.
+        """
+        if not self._is_group_chat(update):
+            return None
+        if self._is_group_owner_turn(update):
+            return None
+        return self.settings.group_chat_restricted_tools or None
+
+    def _policy_appendix(self, update: Update) -> Optional[str]:
+        """Soft policy text appended to the system prompt in groups only."""
+        if self._is_group_chat(update):
+            return self.settings.group_chat_policy or None
+        return None
+
     def _inject_deps(self, handler: Callable) -> Callable:  # type: ignore[type-arg]
         """Wrap handler to inject dependencies into context.bot_data."""
 
@@ -1129,6 +1159,8 @@ class MessageOrchestrator:
                 force_new=force_new,
                 interrupt_event=interrupt_event,
                 model=self._model_override(update),
+                disallowed_tools=self._restricted_tools_override(update),
+                append_system_prompt=self._policy_appendix(update),
             )
 
             # New session created successfully — clear the one-shot flag
@@ -1379,6 +1411,8 @@ class MessageOrchestrator:
                 on_stream=on_stream,
                 force_new=force_new,
                 model=self._model_override(update),
+                disallowed_tools=self._restricted_tools_override(update),
+                append_system_prompt=self._policy_appendix(update),
             )
 
             if force_new:
@@ -1589,6 +1623,8 @@ class MessageOrchestrator:
                 force_new=force_new,
                 images=images,
                 model=self._model_override(update),
+                disallowed_tools=self._restricted_tools_override(update),
+                append_system_prompt=self._policy_appendix(update),
             )
         finally:
             heartbeat.cancel()

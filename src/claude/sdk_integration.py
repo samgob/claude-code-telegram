@@ -278,11 +278,18 @@ class ClaudeSDKManager:
         interrupt_event: Optional[asyncio.Event] = None,
         images: Optional[List[Dict[str, str]]] = None,
         model: Optional[str] = None,
+        disallowed_tools: Optional[List[str]] = None,
+        append_system_prompt: Optional[str] = None,
     ) -> ClaudeResponse:
         """Execute Claude Code command via SDK.
 
         ``model`` overrides the configured default model for this call only
         (used e.g. for group-chat sessions via GROUP_CHAT_MODEL).
+        ``disallowed_tools`` are unioned with the configured disallow list
+        for this call only (hard per-turn gating; applies even when
+        DISABLE_TOOL_VALIDATION is set). ``append_system_prompt`` is
+        appended to the bot's base system prompt without replacing it
+        (soft policy layer for group chats).
         """
         start_time = asyncio.get_event_loop().time()
 
@@ -292,6 +299,8 @@ class ClaudeSDKManager:
             session_id=session_id,
             continue_session=continue_session,
             model_override=model,
+            extra_disallowed_tools=disallowed_tools,
+            has_system_prompt_appendix=bool(append_system_prompt),
         )
 
         try:
@@ -315,6 +324,15 @@ class ClaudeSDKManager:
                     path=str(claude_md_path),
                 )
 
+            # Per-call policy appendix (e.g. group-chat rules). Appended so
+            # the base boundary instructions + CLAUDE.md are preserved —
+            # the SDK's SystemPromptPreset "append" mechanism only composes
+            # with the built-in claude_code preset, and this bot supplies
+            # its own string prompt, so string concatenation IS the append
+            # mechanism here.
+            if append_system_prompt:
+                base_prompt += "\n\n" + append_system_prompt
+
             # When DISABLE_TOOL_VALIDATION=true, pass None for allowed/disallowed
             # tools so the SDK does not restrict tool usage (e.g. MCP tools).
             if self.config.disable_tool_validation:
@@ -323,6 +341,18 @@ class ClaudeSDKManager:
             else:
                 sdk_allowed_tools = self.config.claude_allowed_tools
                 sdk_disallowed_tools = self.config.claude_disallowed_tools
+
+            # Per-call hard tool gating (e.g. non-owner group-chat turns):
+            # union with the configured disallow list. Applied AFTER the
+            # DISABLE_TOOL_VALIDATION branch on purpose — per-sender
+            # restrictions are a security gate, not tool-name validation,
+            # so they hold even in relaxed environments. In Claude Code,
+            # disallowedTools always beat allowedTools, so a tool listed in
+            # both claude_allowed_tools and this list is blocked.
+            if disallowed_tools:
+                sdk_disallowed_tools = list(
+                    dict.fromkeys([*(sdk_disallowed_tools or []), *disallowed_tools])
+                )
 
             # Build Claude Agent options
             options = ClaudeAgentOptions(

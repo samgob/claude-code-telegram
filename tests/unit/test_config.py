@@ -125,6 +125,86 @@ def test_group_chat_model_setting():
         assert settings.group_chat_model == "claude-opus-4-8"
 
 
+def test_group_chat_owner_id_parsing():
+    """Owner id parses from string; blank/unset become None."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        settings = Settings(
+            telegram_bot_token="test_token",
+            telegram_bot_username="test_bot",
+            approved_directory=tmp_dir,
+            group_chat_owner_id="123456789",
+        )
+        assert settings.group_chat_owner_id == 123456789
+
+        blank = Settings(
+            telegram_bot_token="test_token",
+            telegram_bot_username="test_bot",
+            approved_directory=tmp_dir,
+            group_chat_owner_id="  ",
+        )
+        assert blank.group_chat_owner_id is None
+
+        unset = Settings(
+            telegram_bot_token="test_token",
+            telegram_bot_username="test_bot",
+            approved_directory=tmp_dir,
+        )
+        assert unset.group_chat_owner_id is None
+
+
+def test_group_chat_restricted_tools_default():
+    """Restricted tools default to the write/execute set."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        settings = Settings(
+            telegram_bot_token="test_token",
+            telegram_bot_username="test_bot",
+            approved_directory=tmp_dir,
+        )
+
+        assert settings.group_chat_restricted_tools == [
+            "Edit",
+            "Write",
+            "NotebookEdit",
+            "Bash",
+        ]
+
+
+def test_group_chat_restricted_tools_parsing():
+    """Restricted tools parse from a comma-separated env string."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        settings = Settings(
+            telegram_bot_token="test_token",
+            telegram_bot_username="test_bot",
+            approved_directory=tmp_dir,
+            group_chat_restricted_tools="Bash, Write",
+        )
+
+        assert settings.group_chat_restricted_tools == ["Bash", "Write"]
+
+
+def test_group_chat_policy_default_and_override():
+    """Policy defaults to the family-chat rules; env value overrides."""
+    from src.config.settings import DEFAULT_GROUP_CHAT_POLICY
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        settings = Settings(
+            telegram_bot_token="test_token",
+            telegram_bot_username="test_bot",
+            approved_directory=tmp_dir,
+        )
+        assert settings.group_chat_policy == DEFAULT_GROUP_CHAT_POLICY
+        assert settings.group_chat_policy.startswith("This is a shared family chat.")
+        assert "[Sam] is the account owner" in settings.group_chat_policy
+
+        overridden = Settings(
+            telegram_bot_token="test_token",
+            telegram_bot_username="test_bot",
+            approved_directory=tmp_dir,
+            group_chat_policy="House rules only.",
+        )
+        assert overridden.group_chat_policy == "House rules only."
+
+
 def test_security_relaxation_settings_defaults_and_overrides():
     """Security relaxation settings should default to False and be configurable."""
     with tempfile.TemporaryDirectory() as tmp_dir:

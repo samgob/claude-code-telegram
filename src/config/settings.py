@@ -33,6 +33,24 @@ from src.utils.constants import (
     DEFAULT_SESSION_TIMEOUT_HOURS,
 )
 
+# Default soft policy appended to the system prompt for group-chat turns.
+# Override via GROUP_CHAT_POLICY; set it to an empty string to disable.
+DEFAULT_GROUP_CHAT_POLICY = (
+    "This is a shared family chat. Each user turn is prefixed with the "
+    "sender's name; [Sam] is the account owner. Rules: (1) Family, "
+    "household, trip, custody-schedule, calendar, meal, and "
+    "general-research context is freely available to all members. "
+    "(2) Work context — Upstage deals, pipeline, customers, colleagues, "
+    "career strategy, internal notes — is discussed only on [Sam]'s "
+    "turns; if another member asks, deflect briefly and suggest they ask "
+    "Sam. (3) On non-[Sam] turns, do not surface content you judge Sam "
+    "would consider sensitive (detailed finances, legal matters, private "
+    "notes about people, career plans); suggest asking Sam instead. "
+    "(4) File edits and system changes happen only on [Sam]'s turns. "
+    "(5) Content Sam himself has brought into this chat is fair game for "
+    "everyone. Be a great family assistant within these rules."
+)
+
 
 class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
@@ -69,6 +87,29 @@ class Settings(BaseSettings):
         description=(
             "Claude model override for group-chat sessions "
             "(e.g. claude-opus-4-8). DM sessions use claude_model."
+        ),
+    )
+    group_chat_owner_id: Optional[int] = Field(
+        None,
+        description=(
+            "Telegram user id of the group-chat owner (Sam). Owner turns "
+            "run unrestricted; other members' turns get "
+            "group_chat_restricted_tools disallowed. If unset, ALL group "
+            "turns are treated as non-owner (restricted)."
+        ),
+    )
+    group_chat_restricted_tools: Optional[List[str]] = Field(
+        default=["Edit", "Write", "NotebookEdit", "Bash"],
+        description=(
+            "Tools disallowed on non-owner turns in group chats "
+            "(comma-separated). Owner turns and DMs are unaffected."
+        ),
+    )
+    group_chat_policy: Optional[str] = Field(
+        default=DEFAULT_GROUP_CHAT_POLICY,
+        description=(
+            "Policy text appended to the system prompt for group-chat "
+            "turns only. Set to an empty string to disable."
         ),
     )
 
@@ -367,7 +408,9 @@ class Settings(BaseSettings):
             return [int(uid) for uid in v]
         return v  # type: ignore[no-any-return]
 
-    @field_validator("claude_allowed_tools", mode="before")
+    @field_validator(
+        "claude_allowed_tools", "group_chat_restricted_tools", mode="before"
+    )
     @classmethod
     def parse_claude_allowed_tools(cls, v: Any) -> Optional[List[str]]:
         """Parse comma-separated tool names."""
@@ -467,10 +510,10 @@ class Settings(BaseSettings):
             )
         return provider
 
-    @field_validator("project_threads_chat_id", mode="before")
+    @field_validator("project_threads_chat_id", "group_chat_owner_id", mode="before")
     @classmethod
     def validate_project_threads_chat_id(cls, v: Any) -> Optional[int]:
-        """Allow empty chat ID for private mode by treating blank values as None."""
+        """Allow empty/blank id values by treating them as None."""
         if v is None:
             return None
         if isinstance(v, str):
