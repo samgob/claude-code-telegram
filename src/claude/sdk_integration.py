@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional
@@ -311,18 +312,55 @@ class ClaudeSDKManager:
                 stderr_lines.append(line)
                 logger.debug("Claude CLI stderr", line=line)
 
-            # Build system prompt, loading CLAUDE.md from working directory if present
+            # Build system prompt, loading CLAUDE.md into it. The SDK does
+            # NOT load any CLAUDE.md when a custom string system_prompt is
+            # supplied, so both the user-global file (~/.claude/CLAUDE.md —
+            # the hot cache of people/deals/conventions) and the project one
+            # must be injected manually here.
             base_prompt = (
                 f"All file operations must stay within {working_directory}. "
                 "Use relative paths."
             )
-            claude_md_path = Path(working_directory) / "CLAUDE.md"
-            if claude_md_path.exists():
-                base_prompt += "\n\n" + claude_md_path.read_text(encoding="utf-8")
-                logger.info(
-                    "Loaded CLAUDE.md into system prompt",
-                    path=str(claude_md_path),
+            for claude_md_path in (
+                Path.home() / ".claude" / "CLAUDE.md",
+                Path(working_directory) / "CLAUDE.md",
+            ):
+                if claude_md_path.exists():
+                    base_prompt += "\n\n" + claude_md_path.read_text(encoding="utf-8")
+                    logger.info(
+                        "Loaded CLAUDE.md into system prompt",
+                        path=str(claude_md_path),
+                    )
+
+            # Persistent memory index for this working directory — mirrors
+            # the desktop harness, which injects MEMORY.md every session.
+            sanitized_cwd = re.sub(r"[^A-Za-z0-9]", "-", str(working_directory))
+            memory_dir = Path.home() / ".claude" / "projects" / sanitized_cwd / "memory"
+            memory_index = memory_dir / "MEMORY.md"
+            if memory_index.exists():
+                base_prompt += (
+                    f"\n\n# Memory index (files live in {memory_dir})\n\n"
+                    + memory_index.read_text(encoding="utf-8")
                 )
+                logger.info(
+                    "Loaded memory index into system prompt",
+                    path=str(memory_index),
+                )
+
+            # Standing grounding rule for every bot session (DM and group).
+            base_prompt += (
+                "\n\n# Ground before acting\n"
+                "Before acting on ANY request (calendar changes, drafts, "
+                "logs, purchases, research), check whether a relevant skill "
+                "or memory file covers it: skills live in "
+                "~/.claude/skills/<name>/SKILL.md; memory files are listed "
+                "in the memory index above. Conventions (which calendar to "
+                "use, event durations, file formats, voice) usually already "
+                "exist — read them first instead of guessing. Never invent "
+                "specifics the user did not give (durations, locations, "
+                "calendars, amounts); if a detail is missing and no "
+                "convention covers it, ask before acting."
+            )
 
             # Per-call policy appendix (e.g. group-chat rules). Appended so
             # the base boundary instructions + CLAUDE.md are preserved —
