@@ -207,7 +207,8 @@ def create_test_config(**overrides: Any) -> Settings:
     test_dir = Path(test_values["approved_directory"])
     test_dir.mkdir(parents=True, exist_ok=True)
 
-    # Create settings with test values
-    settings = Settings(**test_values)
+    # Create settings with test values, isolated from any real .env file so
+    # test defaults never depend on the developer's local configuration
+    settings = Settings(_env_file=None, **test_values)
 
     return settings

@@ -77,6 +77,7 @@ def test_group_chat_settings_defaults():
     """Group chat settings should default to disabled."""
     with tempfile.TemporaryDirectory() as tmp_dir:
         settings = Settings(
+            _env_file=None,
             telegram_bot_token="test_token",
             telegram_bot_username="test_bot",
             approved_directory=tmp_dir,
@@ -145,6 +146,7 @@ def test_group_chat_owner_id_parsing():
         assert blank.group_chat_owner_id is None
 
         unset = Settings(
+            _env_file=None,
             telegram_bot_token="test_token",
             telegram_bot_username="test_bot",
             approved_directory=tmp_dir,
@@ -156,6 +158,7 @@ def test_group_chat_restricted_tools_default():
     """Restricted tools default to the write/execute set."""
     with tempfile.TemporaryDirectory() as tmp_dir:
         settings = Settings(
+            _env_file=None,
             telegram_bot_token="test_token",
             telegram_bot_username="test_bot",
             approved_directory=tmp_dir,
@@ -188,6 +191,7 @@ def test_group_chat_policy_default_and_override():
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         settings = Settings(
+            _env_file=None,
             telegram_bot_token="test_token",
             telegram_bot_username="test_bot",
             approved_directory=tmp_dir,
@@ -209,6 +213,7 @@ def test_security_relaxation_settings_defaults_and_overrides():
     """Security relaxation settings should default to False and be configurable."""
     with tempfile.TemporaryDirectory() as tmp_dir:
         defaults = Settings(
+            _env_file=None,
             telegram_bot_token="test_token",
             telegram_bot_username="test_bot",
             approved_directory=tmp_dir,

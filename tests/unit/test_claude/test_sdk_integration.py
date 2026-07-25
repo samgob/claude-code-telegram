@@ -879,6 +879,7 @@ class TestClaudeSandboxSettings:
     async def test_claude_model_none_when_unset(self, tmp_path):
         """Test that model is None when claude_model is not configured."""
         config = Settings(
+            _env_file=None,
             telegram_bot_token="test:token",
             telegram_bot_username="testbot",
             approved_directory=tmp_path,
