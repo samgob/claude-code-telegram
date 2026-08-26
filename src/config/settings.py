@@ -355,6 +355,14 @@ class Settings(BaseSettings):
 
     # Agentic platform settings
     enable_api_server: bool = Field(False, description="Enable FastAPI webhook server")
+    api_server_host: str = Field(
+        "127.0.0.1",
+        description=(
+            "Webhook API bind host. Localhost by default — the routine "
+            "notification endpoint carries a bearer secret and is only "
+            "called from this machine."
+        ),
+    )
     api_server_port: int = Field(8080, description="Webhook API server port")
     enable_scheduler: bool = Field(False, description="Enable job scheduler")
     github_webhook_secret: Optional[str] = Field(

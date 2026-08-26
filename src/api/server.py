@@ -23,6 +23,7 @@ def create_api_app(
     event_bus: EventBus,
     settings: Settings,
     db_manager: Optional[DatabaseManager] = None,
+    bot: Optional[Any] = None,
 ) -> FastAPI:
     """Create the FastAPI application."""
 
@@ -36,6 +37,115 @@ def create_api_app(
     @app.get("/health")
     async def health_check() -> Dict[str, str]:
         return {"status": "ok"}
+
+    # NOTE: must be registered BEFORE the catch-all /webhooks/{provider}
+    # route below, or provider="routine" swallows it.
+    @app.post("/webhooks/routine")
+    async def receive_routine_notification(
+        request: Request,
+        authorization: Optional[str] = Header(None),
+    ) -> Dict[str, Any]:
+        """Relay a scheduled-routine completion to the owner's Telegram chat.
+
+        Deliberately does NOT publish to the event bus — no Claude run fires
+        on notification. The bot just forwards the headline and records
+        message_id -> payload so a later user reply (Telegram reply-to) can
+        be routed back to this routine's output files with full context.
+        """
+        secret = settings.webhook_api_secret
+        if not secret:
+            raise HTTPException(
+                status_code=500,
+                detail="Webhook API secret not configured.",
+            )
+        if not verify_shared_secret(authorization, secret):
+            raise HTTPException(status_code=401, detail="Invalid authorization")
+        if bot is None:
+            raise HTTPException(status_code=503, detail="Bot not wired into API server")
+
+        try:
+            payload: Dict[str, Any] = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="Body must be JSON")
+
+        routine = str(payload.get("routine", "")).strip()
+        headline = str(payload.get("headline", "")).strip()
+        if not routine or not headline:
+            raise HTTPException(
+                status_code=400, detail="routine and headline are required"
+            )
+
+        # Chat targeting: "dm" (default) = owner notification chat;
+        # "family" = the shared family group chat.
+        chat_target = str(payload.get("chat", "dm")).strip() or "dm"
+        if chat_target == "family":
+            group_ids = settings.group_chat_ids or []
+            if not group_ids:
+                raise HTTPException(
+                    status_code=400,
+                    detail="chat=family requires GROUP_CHAT_IDS to be set",
+                )
+            chat_id = group_ids[0]
+        elif chat_target == "dm":
+            chat_ids = settings.notification_chat_ids or []
+            if not chat_ids:
+                raise HTTPException(
+                    status_code=500, detail="NOTIFICATION_CHAT_IDS not configured"
+                )
+            chat_id = chat_ids[0]
+        else:
+            raise HTTPException(status_code=400, detail="chat must be 'dm' or 'family'")
+
+        # Optional mailbox registration: the sending session declares a
+        # feedback file + topic so replies (and confidently classified
+        # bare messages) can be appended back to it while it waits.
+        mailbox_id: Optional[int] = None
+        mailbox_path = str(payload.get("mailbox_path") or "").strip()
+        if mailbox_path and db_manager is not None:
+            scope = str(payload.get("scope") or "").strip() or (
+                "family" if chat_target == "family" else "private"
+            )
+            if scope not in ("private", "family"):
+                raise HTTPException(
+                    status_code=400, detail="scope must be 'private' or 'family'"
+                )
+            try:
+                ttl_minutes = int(payload.get("ttl_minutes") or 240)
+            except (TypeError, ValueError):
+                raise HTTPException(
+                    status_code=400, detail="ttl_minutes must be an integer"
+                )
+            mailbox_id = await _register_mailbox(
+                db_manager,
+                routine=routine,
+                mailbox_path=mailbox_path,
+                topic=str(payload.get("topic") or headline).strip(),
+                scope=scope,
+                ttl_minutes=ttl_minutes,
+            )
+
+        text = f"\U0001f916 {routine} — {headline}"
+        message = await bot.send_message(chat_id=chat_id, text=text)
+
+        if db_manager is not None:
+            await _record_routine_notification(
+                db_manager,
+                message_id=message.message_id,
+                chat_id=chat_id,
+                routine=routine,
+                headline=headline,
+                output_path=payload.get("output_path"),
+                status_path=payload.get("status_path"),
+                session_id=payload.get("session_id"),
+                mailbox_id=mailbox_id,
+            )
+
+        logger.info(
+            "Routine notification relayed",
+            routine=routine,
+            message_id=message.message_id,
+        )
+        return {"status": "sent", "message_id": message.message_id}
 
     @app.post("/webhooks/{provider}")
     async def receive_webhook(
@@ -172,19 +282,86 @@ async def _try_record_webhook(
         return inserted
 
 
+async def _record_routine_notification(
+    db_manager: DatabaseManager,
+    message_id: int,
+    chat_id: int,
+    routine: str,
+    headline: str,
+    output_path: Optional[str],
+    status_path: Optional[str],
+    session_id: Optional[str],
+    mailbox_id: Optional[int] = None,
+) -> None:
+    """Persist the Telegram message_id -> routine payload mapping."""
+    async with db_manager.get_connection() as conn:
+        await conn.execute(
+            """
+            INSERT OR REPLACE INTO routine_notifications
+            (message_id, chat_id, routine, headline, output_path,
+             status_path, session_id, mailbox_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                message_id,
+                chat_id,
+                routine,
+                headline,
+                output_path,
+                status_path,
+                session_id,
+                mailbox_id,
+            ),
+        )
+        await conn.commit()
+
+
+async def _register_mailbox(
+    db_manager: DatabaseManager,
+    routine: str,
+    mailbox_path: str,
+    topic: str,
+    scope: str,
+    ttl_minutes: int,
+) -> int:
+    """Register (or refresh) a feedback mailbox; returns its id.
+
+    Re-registering the same routine+path replaces the old row so a session
+    that re-notifies extends its TTL instead of duplicating router
+    candidates.
+    """
+    async with db_manager.get_connection() as conn:
+        await conn.execute(
+            "DELETE FROM mailboxes WHERE routine = ? AND mailbox_path = ?",
+            (routine, mailbox_path),
+        )
+        cursor = await conn.execute(
+            """
+            INSERT INTO mailboxes
+                (routine, mailbox_path, topic, scope, expires_at)
+            VALUES (?, ?, ?, ?, datetime('now', ?))
+            """,
+            (routine, mailbox_path, topic, scope, f"{int(ttl_minutes):+d} minutes"),
+        )
+        mailbox_id = cursor.lastrowid
+        await conn.commit()
+        return int(mailbox_id or 0)
+
+
 async def run_api_server(
     event_bus: EventBus,
     settings: Settings,
     db_manager: Optional[DatabaseManager] = None,
+    bot: Optional[Any] = None,
 ) -> None:
     """Run the FastAPI server using uvicorn."""
     import uvicorn
 
-    app = create_api_app(event_bus, settings, db_manager)
+    app = create_api_app(event_bus, settings, db_manager, bot=bot)
 
     config = uvicorn.Config(
         app=app,
-        host="0.0.0.0",
+        host=settings.api_server_host,
         port=settings.api_server_port,
         log_level="info" if not settings.debug else "debug",
     )

@@ -1057,6 +1057,154 @@ class MessageOrchestrator:
 
         return caption_sent
 
+    def _sender_name(self, update: Update) -> str:
+        """Display name for mailbox attribution ("Sam", "V", ...)."""
+        user = update.effective_user
+        if user is None:
+            return "Unknown"
+        return user.first_name or user.username or str(user.id)
+
+    async def _mailbox_route(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> tuple[bool, Optional[str]]:
+        """Deterministic mailbox capture + contextual routing.
+
+        Returns (handled, directive):
+        - handled=True: the message was a swipe-reply to a notification
+          with a live mailbox; it was appended in Python and acked — no
+          model run should fire (the waiting session owns the response).
+        - directive: set when a bare message was confidently routed to a
+          mailbox (tee) — prepend to the prompt so the chat session
+          responds conversationally without duplicating the routed work.
+        """
+        from .mailbox_router import append_to_mailbox, classify_route
+
+        storage = context.bot_data.get("storage")
+        message = update.message
+        if not storage or message is None or not message.text:
+            return False, None
+        sender = self._sender_name(update)
+
+        try:
+            # Strong binding: swipe-reply to a mailbox-linked notification.
+            reply = message.reply_to_message
+            if reply is not None:
+                row = await storage.get_routine_notification(reply.message_id)
+                if row and row.get("mailbox_id"):
+                    box = await storage.get_live_mailbox(row["mailbox_id"])
+                    if box and append_to_mailbox(
+                        box["mailbox_path"],
+                        sender,
+                        message.text,
+                        self.settings.approved_directory,
+                        via="reply",
+                    ):
+                        await message.reply_text(f"\U0001f4e8 → {box['routine']}")
+                        return True, None
+                # No/expired/failed mailbox: fall through to the normal
+                # model run (routine reply directive still applies).
+                return False, None
+
+            # Contextual routing: bare message vs live mailboxes for this
+            # chat's scope (family group sees family-scoped only).
+            boxes = await storage.get_live_mailboxes(
+                family_only=self._is_group_chat(update)
+            )
+            if not boxes:
+                return False, None
+            target = await classify_route(
+                message.text, boxes, cli_path=self.settings.claude_cli_path
+            )
+            if not target:
+                return False, None
+            box = next(b for b in boxes if b["routine"] == target)
+            if not append_to_mailbox(
+                box["mailbox_path"],
+                sender,
+                message.text,
+                self.settings.approved_directory,
+                via="router",
+            ):
+                return False, None
+            await message.reply_text(f"\U0001f4e8 → {box['routine']}")
+            directive = (
+                "<mailbox-routed>\n"
+                "This message was also delivered to the waiting "
+                f"'{box['routine']}' session's feedback mailbox "
+                f"(topic: {box['topic']}). That session will act on it. "
+                "Respond conversationally if a response is natural, but "
+                "do NOT perform that session's work yourself and do not "
+                "re-deliver the feedback anywhere.\n"
+                "</mailbox-routed>"
+            )
+            return False, directive
+        except Exception:
+            logger.warning("Mailbox routing failed — normal handling", exc_info=True)
+            return False, None
+
+    async def _routine_reply_context(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> Optional[str]:
+        """Link an incoming message to relayed routine notifications.
+
+        Strong binding: the message is a Telegram reply to a relayed
+        routine-completion notification — return a directive block pointing
+        Claude at that routine's output/status files.
+        Weak binding: not a reply — return a short listing of recent
+        notifications in this chat (if any) so references like "the digest
+        you just sent" resolve naturally.
+        """
+        storage = context.bot_data.get("storage")
+        if not storage or update.message is None:
+            return None
+        try:
+            reply = update.message.reply_to_message
+            if reply is not None:
+                row = await storage.get_routine_notification(reply.message_id)
+                if row:
+                    return (
+                        "<routine-notification-reply>\n"
+                        "The user's message below is a reply to this "
+                        "scheduled-routine notification:\n"
+                        f"- routine: {row['routine']}\n"
+                        f"- headline: {row['headline']}\n"
+                        f"- full output file: {row['output_path'] or 'n/a'}\n"
+                        f"- status file: {row['status_path'] or 'n/a'}\n"
+                        f"- routine session id: {row['session_id'] or 'n/a'}\n"
+                        "Read the output/status files FIRST to load the "
+                        "routine's context, then do what the user asks. If "
+                        "the action requires tools this session lacks (work "
+                        "Gmail, Attio, Slack, Fireflies), append a JSON line "
+                        "to '.memory/pending-actions/queue.jsonl' under the "
+                        "approved directory — fields: requested, context "
+                        "(file paths + key facts, self-contained), source, "
+                        "ts — and tell the user it is queued for the next "
+                        "15-minute Desktop runner.\n"
+                        "</routine-notification-reply>"
+                    )
+            recent = await storage.get_recent_routine_notifications(
+                update.message.chat.id, limit=3
+            )
+            if recent:
+                lines = [
+                    "<recent-routine-notifications>",
+                    "Routine notifications recently relayed to this chat "
+                    "(newest first). If the user's message refers to one, "
+                    "read its output/status files for context first:",
+                ]
+                for i, r in enumerate(recent, 1):
+                    lines.append(
+                        f"{i}. {r['routine']} — \"{r['headline']}\" "
+                        f"(output: {r['output_path'] or 'n/a'}, "
+                        f"status: {r['status_path'] or 'n/a'}, "
+                        f"at {r['created_at']})"
+                    )
+                lines.append("</recent-routine-notifications>")
+                return "\n".join(lines)
+        except Exception:
+            logger.warning("Routine reply-context lookup failed", exc_info=True)
+        return None
+
     async def agentic_text(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
@@ -1077,6 +1225,15 @@ class MessageOrchestrator:
             if not allowed:
                 await update.message.reply_text(f"⏱️ {limit_message}")
                 return
+
+        # Mailbox capture/routing (Phase 2 no-watchers): a swipe-reply to a
+        # mailbox-linked notification is appended in Python and acked — the
+        # waiting session owns the response, so no model run fires. A
+        # confidently routed bare message tees into the mailbox and then
+        # continues as a normal conversational turn.
+        route_handled, route_directive = await self._mailbox_route(update, context)
+        if route_handled:
+            return
 
         chat = update.message.chat
         await chat.send_action("typing")
@@ -1150,8 +1307,14 @@ class MessageOrchestrator:
 
         success = True
         try:
+            prompt_text = self._attribute_sender(update, message_text)
+            routine_ctx = await self._routine_reply_context(update, context)
+            if routine_ctx:
+                prompt_text = f"{routine_ctx}\n\n{prompt_text}"
+            if route_directive:
+                prompt_text = f"{route_directive}\n\n{prompt_text}"
             claude_response = await claude_integration.run_command(
-                prompt=self._attribute_sender(update, message_text),
+                prompt=prompt_text,
                 working_directory=current_dir,
                 user_id=self._session_owner_id(update),
                 session_id=session_id,

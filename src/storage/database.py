@@ -310,6 +310,52 @@ class DatabaseManager:
                     ON project_threads(project_slug);
                 """,
             ),
+            (
+                5,
+                """
+                -- Routine notification relay: maps the Telegram message_id
+                -- of a relayed routine-completion notification to the
+                -- routine's output/status files, so a user reply (Telegram
+                -- reply-to) can be routed back to that routine's context.
+                CREATE TABLE IF NOT EXISTS routine_notifications (
+                    message_id INTEGER PRIMARY KEY,
+                    chat_id INTEGER NOT NULL,
+                    routine TEXT NOT NULL,
+                    headline TEXT NOT NULL,
+                    output_path TEXT,
+                    status_path TEXT,
+                    session_id TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_routine_notifications_chat
+                    ON routine_notifications(chat_id, created_at);
+                """,
+            ),
+            (
+                6,
+                """
+                -- Mailboxes: sessions waiting for feedback register a file
+                -- path + topic + scope + TTL when relaying a notification.
+                -- Swipe-replies (and confidently classified bare messages)
+                -- are appended to the mailbox file by the daemon in Python,
+                -- deliberately outside the per-turn tool gate.
+                CREATE TABLE IF NOT EXISTS mailboxes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    routine TEXT NOT NULL,
+                    mailbox_path TEXT NOT NULL,
+                    topic TEXT NOT NULL,
+                    scope TEXT NOT NULL DEFAULT 'private',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    expires_at TIMESTAMP NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_mailboxes_live
+                    ON mailboxes(expires_at, scope);
+
+                ALTER TABLE routine_notifications ADD COLUMN mailbox_id INTEGER;
+                """,
+            ),
         ]
 
     async def _init_pool(self):

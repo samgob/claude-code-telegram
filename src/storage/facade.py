@@ -57,6 +57,97 @@ class Storage:
         logger.info("Closing storage system")
         await self.db_manager.close()
 
+    async def get_routine_notification(self, message_id: int):
+        """Look up a relayed routine notification by its Telegram message_id."""
+        async with self.db_manager.get_connection() as conn:
+            cursor = await conn.execute(
+                """
+                SELECT message_id, chat_id, routine, headline, output_path,
+                       status_path, session_id, mailbox_id, created_at
+                FROM routine_notifications WHERE message_id = ?
+                """,
+                (message_id,),
+            )
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+    async def register_mailbox(
+        self,
+        routine: str,
+        mailbox_path: str,
+        topic: str,
+        scope: str = "private",
+        ttl_minutes: int = 240,
+    ) -> int:
+        """Register (or refresh) a feedback mailbox; returns its id.
+
+        Re-registering the same routine+path replaces the old row so a
+        session that re-notifies just extends its TTL instead of creating
+        duplicate router candidates.
+        """
+        async with self.db_manager.get_connection() as conn:
+            await conn.execute(
+                "DELETE FROM mailboxes WHERE routine = ? AND mailbox_path = ?",
+                (routine, mailbox_path),
+            )
+            cursor = await conn.execute(
+                """
+                INSERT INTO mailboxes
+                    (routine, mailbox_path, topic, scope, expires_at)
+                VALUES (?, ?, ?, ?, datetime('now', ?))
+                """,
+                (routine, mailbox_path, topic, scope, f"{int(ttl_minutes):+d} minutes"),
+            )
+            mailbox_id = cursor.lastrowid
+            await conn.commit()
+            return int(mailbox_id or 0)
+
+    async def get_live_mailbox(self, mailbox_id: int):
+        """Fetch one mailbox if it has not expired."""
+        async with self.db_manager.get_connection() as conn:
+            cursor = await conn.execute(
+                """
+                SELECT id, routine, mailbox_path, topic, scope, expires_at
+                FROM mailboxes
+                WHERE id = ? AND expires_at > datetime('now')
+                """,
+                (mailbox_id,),
+            )
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+    async def get_live_mailboxes(self, family_only: bool = False):
+        """All unexpired mailboxes; family chats see family-scoped only."""
+        query = """
+            SELECT id, routine, mailbox_path, topic, scope, expires_at
+            FROM mailboxes
+            WHERE expires_at > datetime('now')
+        """
+        if family_only:
+            query += " AND scope = 'family'"
+        query += " ORDER BY created_at DESC"
+        async with self.db_manager.get_connection() as conn:
+            cursor = await conn.execute(query)
+            rows = await cursor.fetchall()
+            return [dict(r) for r in rows]
+
+    async def get_recent_routine_notifications(self, chat_id: int, limit: int = 3):
+        """Most recent routine notifications relayed to a chat (last 48h)."""
+        async with self.db_manager.get_connection() as conn:
+            cursor = await conn.execute(
+                """
+                SELECT message_id, chat_id, routine, headline, output_path,
+                       status_path, session_id, created_at
+                FROM routine_notifications
+                WHERE chat_id = ?
+                  AND created_at >= datetime('now', '-2 days')
+                ORDER BY created_at DESC LIMIT ?
+                """,
+                (chat_id, limit),
+            )
+            rows = await cursor.fetchall()
+            return [dict(r) for r in rows]
+
     async def health_check(self) -> bool:
         """Check storage system health."""
         return await self.db_manager.health_check()
