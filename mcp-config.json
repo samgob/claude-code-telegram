@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "personal-gmail": {
+      "type": "http",
+      "url": "http://127.0.0.1:8001/mcp"
+    },
+    "apple-events": {
+      "command": "/usr/local/bin/node",
+      "args": ["/Users/samgobrail/Desktop/Claude Homebase/Projects/Claude Routines/apple-events-mcp/node_modules/.bin/mcp-server-apple-events"]
+    }
+  }
+}

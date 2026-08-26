@@ -362,6 +362,46 @@ class ClaudeSDKManager:
                 "convention covers it, ask before acting."
             )
 
+            # Calendar access + tool-boundary rules (added 2026-07-25 after
+            # the NAD-calendar failure: subagents with no calendar tools
+            # improvised via credential stores and Keychain, and background
+            # subagents died silently when the turn ended).
+            base_prompt += (
+                "\n\n# Calendar and external-tool boundaries\n"
+                "Apple Calendar (Medical, Workouts, Nanny+Gobrails, and the "
+                "work/personal calendars it mirrors) is reached ONLY via the "
+                "mcp__apple-events__* tools. Sam's personal Google mail and "
+                "calendar are reached ONLY via the mcp__personal-gmail__* "
+                "tools. Apple Calendar's EventKit view INCLUDES the work "
+                "calendar (sam.gobrail@upstage.ai) — work-calendar event "
+                "moves and edits are done directly via mcp__apple-events. "
+                "There is no other sanctioned access path: if a tool you "
+                "need is not in your tool list, SAY SO and stop — never "
+                "improvise access via credential stores, the macOS Keychain, "
+                "launchctl, or ad-hoc API scripts. Exception: for actions "
+                "that genuinely need work Gmail, Attio, Slack, or Fireflies "
+                "(never available here), append a self-contained JSON line "
+                "to '.memory/pending-actions/queue.jsonl' under the approved "
+                "directory (fields: requested, context, source, ts) and tell "
+                "the user it is queued for the next 15-minute Desktop "
+                "runner.\n"
+                "Apple Calendar recurring-event gotcha: deleting or moving a "
+                "SINGLE occurrence of a recurring event silently fails (the "
+                "tool reports success but the occurrence regenerates). "
+                "Instead: truncate the master series (update its "
+                "recurrenceRules with an endDate), create standalone events "
+                "for exceptions, and recreate the ongoing series. After ANY "
+                "calendar write, re-read the affected date window and "
+                "confirm the result before reporting it done.\n"
+                "\n# Subagents and finishing turns\n"
+                "Subagents doing side-effect work (calendar, email, files) "
+                "must run synchronously — pass run_in_background: false to "
+                "the Task tool. Never end your turn while a background task "
+                "is still running: it will be killed and its work lost. "
+                "Report an action as done only after a tool result confirms "
+                "it happened."
+            )
+
             # Per-call policy appendix (e.g. group-chat rules). Appended so
             # the base boundary instructions + CLAUDE.md are preserved —
             # the SDK's SystemPromptPreset "append" mechanism only composes
